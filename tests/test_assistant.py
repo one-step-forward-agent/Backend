@@ -253,3 +253,15 @@ def test_obsidian_integration_is_gone():
     from app.services.integrations.registry import PROVIDERS
 
     assert "obsidian" not in PROVIDERS and "obsidian" not in {provider.value for provider in Provider}
+
+
+async def test_batch_and_profile_limits(client, user):
+    headers, _ = user
+    reply = (await client.post("/api/assistant/chat", json={"text": "зарядка каждый день в 7:00"}, headers=headers)).json()
+    item = reply["events"][0]
+    flood = [dict(item, title=f"Задача {index}", rrule="FREQ=DAILY") for index in range(40)]
+    await client.put(f"/api/assistant/drafts/{reply['draft_id']}", json={"items": flood}, headers=headers)
+    created = (await client.post(f"/api/assistant/drafts/{reply['draft_id']}/confirm", headers=headers)).json()
+    assert len(created["event_ids"]) <= 500
+    huge = {"spheres": [{"name": "x" * 5000}] * 10}
+    assert (await client.put("/api/me/onboarding", json=huge, headers=headers)).status_code == 422

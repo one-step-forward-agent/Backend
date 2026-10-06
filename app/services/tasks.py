@@ -19,6 +19,8 @@ logger = logging.getLogger(__name__)
 SERIES_HORIZON = timedelta(days=90)
 SERIES_REFILL = timedelta(days=30)
 MAX_OCCURRENCES = 60
+# One confirmation may not flood the calendar (40 daily series would otherwise be 2400 events)
+MAX_EVENTS_PER_BATCH = 500
 MAX_REMINDER_MINUTES = 10080
 UNTIMED_TASK_MINUTES = 30
 _last_extension: datetime | None = None
@@ -121,7 +123,10 @@ async def create_tasks(session: AsyncSession, user: User, items: list[dict], sou
             series_id=str(uuid4()) if rule else None,
             source=source,
         )
-        moments = occurrences(rule, begins, now + SERIES_HORIZON) if rule else [begins]
+        budget = MAX_EVENTS_PER_BATCH - sum(len(group) for group in groups)
+        if budget <= 0:
+            break
+        moments = occurrences(rule, begins, now + SERIES_HORIZON, limit=min(MAX_OCCURRENCES, budget)) if rule else [begins]
         group = [_copy(template, moment, ends - begins) for moment in moments or [begins]]
         session.add_all(group)
         groups.append(group)

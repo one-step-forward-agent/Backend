@@ -131,3 +131,20 @@ def test_rrule_helpers():
     assert describe_rrule("FREQ=WEEKLY;BYDAY=TU,TH") == "по вторникам и четвергам"
     assert describe_rrule("FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR") == "по будням"
     assert describe_rrule("FREQ=DAILY") == "каждый день"
+
+
+def test_parser_is_fast_on_long_adversarial_input():
+    import time as clock
+
+    samples = [
+        "по вторникам и " * 4000,
+        "в 1 " * 12000,
+        "с 1 до " * 8000,
+        "12.12." * 9000,
+        "через " * 9000,
+        "а" * 50000,
+    ]
+    for sample in samples:
+        started = clock.perf_counter()
+        parse(sample[:50000], NOW)
+        assert clock.perf_counter() - started < 1.0, sample[:20]

@@ -28,7 +28,8 @@ async def test_checkin_suggests_moving_untimed_tasks(client, user):
         text, payload = await insights.checkin(session, user_row, now)
         assert "Контрольная точка дня" in text  # tone from onboarding
         assert "Разобрать почту" in text
-        untimed = await session.scalar(select(Event).where(Event.user_id == user_row.id, Event.title == "Разобрать почту"))
+        # Titles are encrypted at rest: compare after loading, not in SQL
+        untimed = next(event for event in await session.scalars(select(Event).where(Event.user_id == user_row.id)) if event.title == "Разобрать почту")
         assert payload["event_ids"][0] == untimed.id
         assert payload["target"] > now.date().isoformat()
 
@@ -42,7 +43,7 @@ async def test_checkin_suggests_moving_untimed_tasks(client, user):
 
     url = f"/internal/bot/notifications/{claimed[0]['id']}/checkin"
     moved = (await client.post(url, json={"chat_id": chat_id, "action": "move"}, headers=BOT_HEADERS)).json()
-    assert moved["moved"] == 1
+    assert moved["moved"] == len(payload["event_ids"]) >= 1  # late in the day both tasks are suggested
     again = (await client.post(url, json={"chat_id": chat_id, "action": "move"}, headers=BOT_HEADERS)).json()
     assert again["moved"] == 0
     assert (await client.post(url, json={"chat_id": chat_id + 1, "action": "move"}, headers=BOT_HEADERS)).status_code == 404

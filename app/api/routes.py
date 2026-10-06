@@ -430,9 +430,10 @@ async def assistant_search(payload: AssistantMessage, user: User = Depends(get_c
         conditions.append(Event.start_at >= datetime.fromisoformat(filters["date_from"]))
     if filters.get("date_to"):
         conditions.append(Event.start_at < datetime.fromisoformat(filters["date_to"]) + timedelta(days=1))
-    for keyword in filters.get("keywords", []):
-        conditions.append(Event.title.ilike(f"%{keyword}%"))
-    events = list((await session.scalars(select(Event).where(*conditions).order_by(Event.start_at))).all())
+    events = list((await session.scalars(select(Event).where(*conditions).order_by(Event.start_at).limit(2000))).all())
+    # Titles are encrypted at rest, so keywords are matched after decryption
+    keywords = [str(word).lower() for word in filters.get("keywords", []) if isinstance(word, str)]
+    events = [event for event in events if all(word in event.title.lower() for word in keywords)]
     return {"filters": filters, "events": [EventRead.model_validate(event) for event in events]}
 
 

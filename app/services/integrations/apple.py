@@ -2,6 +2,8 @@ from datetime import date, datetime, time, timedelta, timezone
 from urllib.parse import urljoin
 from uuid import uuid4
 from xml.etree import ElementTree
+
+from defusedxml import ElementTree as SafeElementTree
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -64,7 +66,8 @@ class AppleCalendarIntegration(IntegrationProvider):
             raise IntegrationError("Неверный Apple ID или пароль приложения")
         if response.status_code != 207:
             raise IntegrationError(f"CalDAV сервер ответил {response.status_code}")
-        return str(response.url), ElementTree.fromstring(response.content)
+        # The CalDAV server is user-supplied: parse its XML without entity expansion or external entities
+        return str(response.url), SafeElementTree.fromstring(response.content)
 
     async def _calendars(self, client: httpx.AsyncClient) -> list[tuple[str, str]]:
         base = self.config.get("server_url") or "https://caldav.icloud.com/"

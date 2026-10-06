@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import ratelimit
 from app.core.config import settings
 from app.models.models import Event, User
 from app.services import tasks
@@ -25,6 +26,7 @@ BUSY_TASK_COUNT = 6
 MAX_SUGGESTIONS = 3
 PRIORITY_RANK = {"low": 0, "medium": 1, "high": 2, "urgent": 3}
 RECOMMENDATION_TTL = 30 * 60
+RECOMMENDATION_CALLS = 20
 _recommendation_cache: dict[int, tuple[float, str, list[dict]]] = {}
 
 GREETINGS = {
@@ -216,7 +218,10 @@ async def recommendations(session: AsyncSession, user: User) -> list[dict]:
     if cached and cached[1] == key and clock.monotonic() - cached[0] < RECOMMENDATION_TTL:
         return cached[2]
     found = rule_recommendations(data)
-    if settings.gigachat_credentials:
+    # GigaChat is paid: at most RECOMMENDATION_CALLS per hour per user, rules otherwise
+    key_name = f"recommendations:{user.id}"
+    if settings.gigachat_credentials and not ratelimit.is_limited(key_name, RECOMMENDATION_CALLS, 3600):
+        ratelimit.record(key_name)
         from services.gigachat import GigaChatClient
 
         try:

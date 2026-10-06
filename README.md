@@ -57,6 +57,8 @@ Copy `.env.example` to `.env` and fill in the values:
 | `ENABLE_DOCS` | Swagger UI and `/openapi.json` (default: on in development, off in production) |
 | `ALLOW_PRIVATE_INTEGRATION_URLS` | Let Jira and CalDAV URLs point to private or loopback addresses (default: on in development, off in production) |
 | `GIGACHAT_CA_BUNDLE` | PEM file with the Russian Trusted Root CA, used to verify GigaChat's TLS certificate |
+| `DATA_ENCRYPTION_KEY` | AES-256 key (32 bytes, base64url) for personal data in the database. **Back it up**: without it the data cannot be read. If empty, a key derived from `SECRET_KEY` is used |
+| `DATA_ENCRYPTION_OLD_KEYS` | Comma-separated previous keys, still used for decryption after a rotation |
 | `INTEGRATIONS_ENCRYPTION_KEY` | Fernet key for integration credentials; derived from `SECRET_KEY` if empty |
 | `BOT_API_TOKEN` | Shared secret for the bot's `/internal/bot/*` API (same value in `tg_bot/.env`) |
 | `TELEGRAM_BOT_USERNAME` | Bot username, used for the `t.me/<bot>?start=<code>` linking link |
@@ -131,6 +133,20 @@ Interactive docs are served at `/docs` (Swagger) and `/redoc`.
 2. The bot receives `/start <code>` and calls `/internal/bot/link`, which stores the chat id on the user.
 3. Every `NOTIFICATION_POLL_SECONDS` the bot calls `/notifications/claim`. That call extends recurring series, queues due reminders, digests and the midday check-in (deduplicated by a key), skips quiet hours, expires stale items, and hands the batch to the bot (`FOR UPDATE SKIP LOCKED`, so several bot instances are safe).
 4. The bot sends each message and acks it. Transient errors are retried up to 3 times. If the user blocked the bot, Telegram is unlinked.
+
+## Data encryption
+
+Personal data is encrypted in the application before it reaches PostgreSQL (AES-256-GCM, `app/core/dataenc.py`), so a database dump or leaked backup shows only ciphertext:
+
+- users: email, name, Telegram username, onboarding profile (login uses `email_hash`, an HMAC of the email);
+- tasks: title, description, location; calendar names; file names; integration account emails;
+- assistant history and drafts; reminder and check-in texts.
+
+Dates and times, ids and statuses stay readable, because the calendar, reminders and statistics filter and sort by them. Passwords are Argon2 hashes; integration credentials are encrypted with `INTEGRATIONS_ENCRYPTION_KEY`.
+
+The key is read from the environment and never stored in the database. Migration `0023` encrypts existing rows. To set or rotate the key: put the new key in `DATA_ENCRYPTION_KEY`, keep the previous one in `DATA_ENCRYPTION_OLD_KEYS` (not needed when moving from the `SECRET_KEY`-derived key), then run `python -m app.core.reencrypt`. Until `DATA_ENCRYPTION_KEY` is set, **do not change `SECRET_KEY`**: the data key is derived from it.
+
+Encryption at rest does not protect against a compromised server (the server holds the key) or data already sent to GigaChat, Google Calendar or Telegram.
 
 ## Tests
 

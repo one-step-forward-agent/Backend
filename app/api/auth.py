@@ -18,6 +18,7 @@ from app.core import ratelimit
 from app.core.auth import create_access_token, decode_access_token, create_refresh_token, decode_refresh_token, hash_password, verify_password
 from app.core.config import settings
 from app.core.database import get_session
+from app.core.dataenc import email_lookup
 from app.models.models import Calendar, Integration, RefreshToken, User
 from app.services.integrations.service import integration_secrets, store_secrets
 from app.schemas import LoginRequest, RefreshRequest, RegisterRequest, TokenResponse
@@ -66,7 +67,7 @@ async def _authenticate(session: AsyncSession, email: str, password: str, ip: st
         ip_key, LOGIN_MAX_FAILURES_PER_IP, LOGIN_WINDOW_SECONDS
     ):
         raise HTTPException(status_code=429, detail="Слишком много попыток входа, попробуйте через 15 минут")
-    user = await session.scalar(select(User).where(User.email == email, User.is_active.is_(True)))
+    user = await session.scalar(select(User).where(User.email_hash.in_(email_lookup(email)), User.is_active.is_(True)))
     if not user or not verify_password(password, user.password_hash):
         ratelimit.record(email_key)
         ratelimit.record(ip_key)
@@ -83,7 +84,7 @@ async def register(payload: RegisterRequest, request: Request, session: AsyncSes
         REGISTER_WINDOW_SECONDS,
         "Слишком много регистраций с вашего адреса, попробуйте позже",
     )
-    if await session.scalar(select(User.id).where(User.email == payload.email)):
+    if await session.scalar(select(User.id).where(User.email_hash.in_(email_lookup(payload.email)))):
         raise HTTPException(status_code=409, detail="Пользователь с таким email уже существует")
     user = User(
         email=payload.email,

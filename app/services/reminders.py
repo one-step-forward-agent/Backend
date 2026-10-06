@@ -3,11 +3,12 @@ import secrets
 from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import and_, or_, select, text, update
+from sqlalchemy import and_, bindparam, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.dataenc import email_lookup
 from app.models.models import Event, Notification, NotificationStatus, ReminderSettings, User
 from app.services import insights, tasks
 from app.services.events import default_calendar
@@ -28,9 +29,10 @@ LEGACY_EVENTS = text(
     "WHERE user_id = :chat_id AND start_at IS NULL AND starts_at IS NOT NULL"
 )
 LEGACY_CONVERSATION = text("UPDATE conversation_messages SET user_id = :user_id WHERE user_id = :chat_id")
+# Placeholder users of the old bot had the email "<chat id>@local.invalid"; emails are encrypted, so match its hash
 LEGACY_PLACEHOLDER_USER = text(
-    "DELETE FROM users WHERE tg_id = :chat_id AND id <> :user_id AND password_hash IS NULL AND email LIKE '%@local.invalid'"
-)
+    "DELETE FROM users WHERE tg_id = :chat_id AND id <> :user_id AND password_hash IS NULL AND email_hash IN :hashes"
+).bindparams(bindparam("hashes", expanding=True))
 
 
 async def get_settings(session: AsyncSession, user: User) -> ReminderSettings:
@@ -301,7 +303,7 @@ async def import_legacy_bot_data(session: AsyncSession, user: User, chat_id: int
     params = {"user_id": user.id, "chat_id": chat_id, "calendar_id": calendar.id, "timezone": user_timezone(user)}
     await session.execute(LEGACY_EVENTS, params)
     await session.execute(LEGACY_CONVERSATION, params)
-    await session.execute(LEGACY_PLACEHOLDER_USER, params)
+    await session.execute(LEGACY_PLACEHOLDER_USER, {**params, "hashes": email_lookup(f"{chat_id}@local.invalid")})
 
 
 async def snooze(session: AsyncSession, notification: Notification, minutes: int) -> Notification:

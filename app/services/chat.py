@@ -25,6 +25,7 @@ MAX_DRAFT_ITEMS = 40
 LOCAL_TEXT_LIMIT = 300
 SEARCH_PAST = timedelta(days=30)
 SEARCH_AHEAD = timedelta(days=365)
+SEARCH_SCAN_LIMIT = 2000
 NOT_FOUND_TEXT = (
     "Задача не найдена. Попробуйте уточнить запрос: укажите слово из названия, дату или период — "
     "например, «когда встреча с Анной?» или «что у меня в пятницу?»"
@@ -197,10 +198,14 @@ async def search(session: AsyncSession, user: User, text: str, tz: ZoneInfo) -> 
     else:
         since, until = now - timedelta(hours=12), now + timedelta(days=7)
     conditions = [Event.user_id == user.id, Event.start_at < until, Event.end_at > since]
-    searchable = func.lower(func.concat_ws(" ", Event.title, func.coalesce(Event.description, ""), func.coalesce(Event.location, "")))
-    for stem in filters["keywords"]:
-        conditions.append(func.replace(searchable, "ё", "е").contains(stem))
-    events = list(await session.scalars(select(Event).where(*conditions).order_by(Event.start_at).limit(100)))
+    events = list(await session.scalars(select(Event).where(*conditions).order_by(Event.start_at).limit(SEARCH_SCAN_LIMIT)))
+    if filters["keywords"]:
+        # Titles are encrypted at rest, so keywords are matched after decryption
+        def searchable(event: Event) -> str:
+            return " ".join(part for part in (event.title, event.description, event.location) if part).lower().replace("ё", "е")
+
+        events = [event for event in events if all(stem in searchable(event) for stem in filters["keywords"])]
+    events = events[:100]
     if filters["time_from"] or filters["time_to"]:
         events = [
             event

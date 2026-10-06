@@ -19,3 +19,4 @@ SpeechRecognition==3.17.0
 pydub==0.25.1
 imageio-ffmpeg==0.6.0
 cryptography==50.0.2
+defusedxml==0.7.1

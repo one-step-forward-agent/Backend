@@ -4,8 +4,8 @@ import dataclasses
 import os
 import uuid
 
-os.environ.setdefault("SECRET_KEY", "test-secret-key-that-is-long-enough-1234567890")
-os.environ.setdefault("BOT_API_TOKEN", "test-bot-token-0123456789abcdef")
+os.environ.setdefault("SECRET_KEY", "test-secret-key-that-is-long-enough-1234567890")  # gitleaks:allow - test-only value
+os.environ.setdefault("BOT_API_TOKEN", "test-bot-token-0123456789abcdef")  # gitleaks:allow - test-only value
 os.environ.setdefault("SBER_AUTHORIZATION_KEY", "")
 os.environ.setdefault("STORAGE_PATH", "/tmp/dayla-test-storage")
 

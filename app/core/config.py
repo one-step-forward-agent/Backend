@@ -53,6 +53,9 @@ class Settings:
     jwt_refresh_expire_days: int = int(os.getenv("JWT_REFRESH_EXPIRE_DAYS", "30"))
     cookie_secure: bool = _bool("COOKIE_SECURE")
     integrations_encryption_key: str | None = os.getenv("INTEGRATIONS_ENCRYPTION_KEY")
+    # AES-256 key for personal data in the database (app/core/dataenc.py)
+    data_encryption_key: str | None = os.getenv("DATA_ENCRYPTION_KEY") or None
+    data_encryption_old_keys: tuple[str, ...] = _list("DATA_ENCRYPTION_OLD_KEYS")
     bot_api_token: str | None = os.getenv("BOT_API_TOKEN")
     telegram_bot_username: str | None = os.getenv("TELEGRAM_BOT_USERNAME")
     telegram_bot_token: str | None = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TOKEN")

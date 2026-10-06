@@ -1,13 +1,15 @@
+import json
 import re
 from datetime import date, datetime, time
 from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.models.models import Priority, Provider
 
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+MAX_PROFILE_CHARS = 20_000
 
 
 def _timezone(value: str | None) -> str | None:
@@ -283,6 +285,12 @@ class OnboardingProfile(BaseModel):
     @classmethod
     def check_timezone(cls, value: str | None) -> str | None:
         return _timezone(value)
+
+    @model_validator(mode="after")
+    def check_size(self) -> "OnboardingProfile":
+        if len(json.dumps(self.model_dump(), ensure_ascii=False)) > MAX_PROFILE_CHARS:
+            raise ValueError("Профиль слишком большой")
+        return self
 
 
 class CompleteRequest(BaseModel):
