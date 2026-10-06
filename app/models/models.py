@@ -15,7 +15,6 @@ class Provider(StrEnum):
     APPLE = "apple"
     JIRA = "jira"
     NOTION = "notion"
-    OBSIDIAN = "obsidian"
 
 
 class Priority(StrEnum):
@@ -56,6 +55,8 @@ class User(Base):
     telegram_linked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     telegram_link_code: Mapped[str | None] = mapped_column(String(64), unique=True)
     telegram_link_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Onboarding answers: purpose, spheres, goals, tone of voice, work days and hours
+    profile: Mapped[dict] = mapped_column(JSONB, default=dict, server_default="{}")
     calendars: Mapped[list["Calendar"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     events: Mapped[list["Event"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     integrations: Mapped[list["Integration"]] = relationship(back_populates="user", cascade="all, delete-orphan")
@@ -99,6 +100,10 @@ class Event(Base):
     sync_status: Mapped[str] = mapped_column(String(20), default=SyncStatus.NOT_SYNCED)
     all_day: Mapped[bool] = mapped_column(Boolean, default=False)
     reminder_minutes: Mapped[int | None] = mapped_column(Integer)
+    # Occurrences of a recurring task share series_id; each keeps the rule so the series can be extended
+    recurrence_rule: Mapped[str | None] = mapped_column(Text)
+    series_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     calendar: Mapped[Calendar] = relationship(back_populates="events")
@@ -170,6 +175,8 @@ class ReminderSettings(Base):
     quiet_hours_start: Mapped[time] = mapped_column(Time, default=time(23, 0))
     quiet_hours_end: Mapped[time] = mapped_column(Time, default=time(8, 0))
     sources: Mapped[list[str]] = mapped_column(ARRAY(String(20)), default=list)
+    checkin_enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
+    checkin_time: Mapped[time] = mapped_column(Time, default=time(13, 0), server_default="13:00")
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     user: Mapped[User] = relationship(back_populates="reminder_settings")
 
@@ -190,6 +197,8 @@ class Notification(Base):
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     error: Mapped[str | None] = mapped_column(Text)
+    # Data for the bot's buttons, e.g. the tasks a midday check-in suggests moving
+    payload: Mapped[dict | None] = mapped_column(JSONB)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -212,3 +221,17 @@ class ConversationMessage(Base):
     role: Mapped[str] = mapped_column(Text)
     content: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class AssistantDraft(Base):
+    """Events the assistant proposed and the user has not confirmed yet."""
+
+    __tablename__ = "assistant_drafts"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    items: Mapped[list[dict]] = mapped_column(JSONB)
+    # {"index": n, "field": "title" | "date" | "time"} while the bot waits for a new value
+    awaiting: Mapped[dict | None] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

@@ -1,6 +1,7 @@
 import subprocess
 from pathlib import Path
 from datetime import datetime, timedelta
+from typing import Literal
 from uuid import uuid4
 
 import httpx
@@ -15,7 +16,25 @@ from app.core import ratelimit
 from app.core.config import settings
 from app.core.database import get_session
 from app.models.models import Calendar, Event, EventFile, Integration, User
-from app.schemas import AssistantConfirmation, AssistantMessage, AssistantResponse, CalendarCreate, CalendarRead, EventCreate, EventRead, EventUpdate, UserRead, UserUpdate
+from app.schemas import (
+    AssistantConfirmation,
+    AssistantMessage,
+    AssistantResponse,
+    CalendarCreate,
+    CalendarRead,
+    ChatRequest,
+    CompleteRequest,
+    DraftUpdate,
+    EventCreate,
+    EventRead,
+    EventUpdate,
+    MoveRequest,
+    OnboardingProfile,
+    UserRead,
+    UserUpdate,
+)
+from app.services import chat, insights, tasks
+from app.services.dates import valid_rrule
 from app.services.events import default_calendar, google_provider, push_new_events_to_google, remember_google_token
 from app.services.integrations.google import google_event_body
 from app.services.integrations.service import event_payload
@@ -73,6 +92,16 @@ async def update_current_user(payload: UserUpdate, user: User = Depends(get_curr
     return user
 
 
+@router.put("/me/onboarding", response_model=UserRead)
+async def save_onboarding(payload: OnboardingProfile, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    user.profile = payload.model_dump()
+    if payload.timezone and not user.timezone:
+        user.timezone = payload.timezone
+    await session.commit()
+    await session.refresh(user)
+    return user
+
+
 @router.get("/calendars", response_model=list[CalendarRead])
 async def list_calendars(user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
     return list((await session.scalars(select(Calendar).where(Calendar.user_id == user.id).order_by(Calendar.id))).all())
@@ -104,12 +133,18 @@ async def create_event(payload: EventCreate, user: User = Depends(get_current_us
         raise HTTPException(status_code=422, detail="end_at must be later than start_at")
     values = payload.model_dump()
     calendar_id = values.pop("calendar_id")
+    values["recurrence_rule"] = valid_rrule(values.get("recurrence_rule"))
+    if payload.recurrence_rule and not values["recurrence_rule"]:
+        raise HTTPException(status_code=422, detail="Invalid recurrence rule")
     calendar = await _owned_calendar(session, user, calendar_id) if calendar_id else await default_calendar(session, user, payload.timezone)
     event = Event(calendar_id=calendar.id, user_id=user.id, **values)
     session.add(event)
+    created = [event]
+    if event.recurrence_rule:
+        created += tasks.add_occurrences(session, event, datetime.now(event.start_at.tzinfo))
     await session.commit()
     await session.refresh(event)
-    await push_new_events_to_google(session, user.id, [event])
+    await push_new_events_to_google(session, user.id, created)
     return event
 
 
@@ -149,10 +184,76 @@ async def update_event(event_id: int, payload: EventUpdate, user: User = Depends
 
 
 @router.delete("/events/{event_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_event(event_id: int, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+async def delete_event(
+    event_id: int,
+    scope: Literal["one", "series"] = "one",
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
     event = await _owned_event(session, user, event_id)
+    if scope == "series":
+        await tasks.delete_series(session, user, event)
+        return
     await session.delete(event)
     await session.commit()
+
+
+@router.post("/events/{event_id}/complete", response_model=EventRead)
+async def complete_event(event_id: int, payload: CompleteRequest, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    event = await tasks.set_completed(session, user, event_id, payload.completed)
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+    return event
+
+
+@router.post("/events/move")
+async def move_events(payload: MoveRequest, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    return {"moved": await tasks.move_events(session, user, payload.event_ids, payload.date)}
+
+
+@router.get("/stats")
+async def stats(days: int = 7, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    return await tasks.daily_stats(session, user, min(max(days, 1), 90))
+
+
+@router.get("/recommendations")
+async def recommendations(user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    return {"items": await insights.recommendations(session, user)}
+
+
+@router.post("/assistant/chat")
+async def assistant_chat(payload: ChatRequest, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    limit_assistant(user)
+    try:
+        return await chat.handle_message(session, user, payload.text)
+    except chat.AssistantUnavailable:
+        raise HTTPException(status_code=503, detail="Временная ошибка — попробуйте ещё раз через минуту") from None
+
+
+@router.put("/assistant/drafts/{draft_id}")
+async def update_draft(draft_id: int, payload: DraftUpdate, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    try:
+        return await chat.replace_items(session, user, draft_id, payload.items)
+    except chat.DraftNotFound:
+        raise HTTPException(status_code=404, detail="Черновик не найден") from None
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from None
+
+
+@router.post("/assistant/drafts/{draft_id}/confirm")
+async def confirm_draft(draft_id: int, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    try:
+        return await chat.confirm_draft(session, user, draft_id)
+    except chat.DraftNotFound:
+        raise HTTPException(status_code=404, detail="Черновик не найден") from None
+
+
+@router.delete("/assistant/drafts/{draft_id}")
+async def cancel_draft(draft_id: int, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    try:
+        return await chat.cancel_draft(session, user, draft_id)
+    except chat.DraftNotFound:
+        raise HTTPException(status_code=404, detail="Черновик не найден") from None
 
 
 @router.post("/events/{event_id}/sync/google", response_model=EventRead)
@@ -250,14 +351,14 @@ async def delete_file(file_id: int, user: User = Depends(get_current_user), sess
 @router.post("/assistant/message", response_model=AssistantResponse)
 async def assistant_message(payload: AssistantMessage, user: User = Depends(get_current_user)):
     if not settings.gigachat_credentials:
-        raise HTTPException(status_code=503, detail="GigaChat is not configured")
+        raise HTTPException(status_code=503, detail="Временная ошибка — попробуйте ещё раз через минуту")
     limit_assistant(user)
     from services.gigachat import GigaChatClient
 
     try:
         result = await GigaChatClient().process_message(payload.text, payload.timezone)
     except Exception as error:
-        raise HTTPException(status_code=502, detail="GigaChat is temporarily unavailable") from error
+        raise HTTPException(status_code=503, detail="Временная ошибка — попробуйте ещё раз через минуту") from error
     return AssistantResponse(answer=result.get("answer"), proposed_events=result.get("events", []))
 
 
@@ -316,14 +417,14 @@ async def export_calendar(user: User = Depends(get_current_user), session: Async
 @router.post("/assistant/search")
 async def assistant_search(payload: AssistantMessage, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
     if not settings.gigachat_credentials:
-        raise HTTPException(status_code=503, detail="GigaChat is not configured")
+        raise HTTPException(status_code=503, detail="Временная ошибка — попробуйте ещё раз через минуту")
     limit_assistant(user)
     from services.gigachat import GigaChatClient
 
     try:
         filters = await GigaChatClient().extract_search_filters(payload.text, payload.timezone)
     except Exception as error:
-        raise HTTPException(status_code=502, detail="GigaChat is temporarily unavailable") from error
+        raise HTTPException(status_code=503, detail="Временная ошибка — попробуйте ещё раз через минуту") from error
     conditions = [Event.user_id == user.id]
     if filters.get("date_from"):
         conditions.append(Event.start_at >= datetime.fromisoformat(filters["date_from"]))

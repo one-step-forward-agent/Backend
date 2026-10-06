@@ -1,5 +1,6 @@
 import re
-from datetime import datetime, time
+from datetime import date, datetime, time
+from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -66,6 +67,7 @@ class UserRead(BaseModel):
     timezone: str | None = None
     telegram_username: str | None = None
     telegram_linked_at: datetime | None = None
+    profile: dict = Field(default_factory=dict)
 
 
 class UserUpdate(BaseModel):
@@ -131,6 +133,7 @@ class EventCreate(BaseModel):
     location: str | None = Field(default=None, max_length=500)
     all_day: bool = False
     reminder_minutes: int | None = Field(default=None, ge=0, le=10080)
+    recurrence_rule: str | None = Field(default=None, max_length=200)
 
 
 class EventUpdate(BaseModel):
@@ -154,6 +157,8 @@ class EventRead(EventCreate):
     source: str
     sync_status: str
     external_id: str | None = None
+    series_id: str | None = None
+    completed_at: datetime | None = None
 
 
 class AssistantMessage(BaseModel):
@@ -187,6 +192,8 @@ class ReminderSettingsBase(BaseModel):
     quiet_hours_start: time = time(23, 0)
     quiet_hours_end: time = time(8, 0)
     sources: list[Provider] = Field(default_factory=list)
+    checkin_enabled: bool = True
+    checkin_time: time = time(13, 0)
 
     @field_validator("lead_times")
     @classmethod
@@ -207,6 +214,8 @@ class ReminderSettingsUpdate(BaseModel):
     quiet_hours_start: time | None = None
     quiet_hours_end: time | None = None
     sources: list[Provider] | None = None
+    checkin_enabled: bool | None = None
+    checkin_time: time | None = None
 
     @field_validator("lead_times")
     @classmethod
@@ -254,3 +263,58 @@ class BotUndoRequest(BaseModel):
 class BotSnoozeRequest(BaseModel):
     chat_id: int
     minutes: int = Field(ge=5, le=1440)
+
+
+class OnboardingProfile(BaseModel):
+    """Answers from the onboarding screens; unknown keys are dropped."""
+
+    purpose: list[str] = Field(default_factory=list, max_length=20)
+    spheres: list[dict] = Field(default_factory=list, max_length=20)
+    toneOfVoice: Literal["neutral", "supportive", "motivating", "strict"] | None = None
+    goals: list[str] = Field(default_factory=list, max_length=20)
+    workDays: list[str] = Field(default_factory=list, max_length=7)
+    workHoursFrom: str | None = Field(default=None, max_length=5)
+    workHoursTo: str | None = Field(default=None, max_length=5)
+    perDayWorkHours: dict = Field(default_factory=dict)
+    timezone: str | None = None
+    integrations: list[str] = Field(default_factory=list, max_length=20)
+
+    @field_validator("timezone")
+    @classmethod
+    def check_timezone(cls, value: str | None) -> str | None:
+        return _timezone(value)
+
+
+class CompleteRequest(BaseModel):
+    completed: bool = True
+
+
+class MoveRequest(BaseModel):
+    event_ids: list[int] = Field(min_length=1, max_length=50)
+    date: date
+
+
+class ChatRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=50000)
+
+
+class DraftUpdate(BaseModel):
+    items: list[dict] = Field(min_length=1, max_length=40)
+
+
+class BotCompleteRequest(BaseModel):
+    completed: bool = True
+
+
+class BotEditRequest(BaseModel):
+    index: int = Field(ge=0, lt=40)
+    field: Literal["title", "date", "time"]
+
+
+class BotRemoveRequest(BaseModel):
+    index: int = Field(ge=0, lt=40)
+
+
+class BotCheckinRequest(BaseModel):
+    chat_id: int
+    action: Literal["move", "ok"]

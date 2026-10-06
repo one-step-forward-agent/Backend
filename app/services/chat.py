@@ -3,73 +3,66 @@ import re
 from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from dateutil.relativedelta import relativedelta
-from dateutil.rrule import rrulestr
-from sqlalchemy import delete, or_, select
+import snowballstemmer
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.models.models import ConversationMessage, Event, User
-from app.services.events import default_calendar, google_provider, push_new_events_to_google, remember_google_token
-from app.services.integrations.service import user_timezone
+from app.models.models import AssistantDraft, ConversationMessage, Event, User
+from app.services import dates, tasks
+from app.services.events import google_provider, remember_google_token
 from app.services.ru import MONTHS, day_label
 
 logger = logging.getLogger(__name__)
 
 CONTEXT_MESSAGES = 12
 CONTEXT_DAYS = 30
-RECURRENCE_WINDOW = timedelta(days=60)
-MAX_OCCURRENCES = 12
-MAX_REMINDER_MINUTES = 10080
 UNDO_WINDOW = timedelta(days=7)
+DRAFT_LIFETIME = timedelta(days=2)
+# A message counts as the new value of a field only shortly after the user tapped "edit"
+EDIT_TIMEOUT = timedelta(minutes=10)
+MAX_DRAFT_ITEMS = 40
+LOCAL_TEXT_LIMIT = 300
+SEARCH_PAST = timedelta(days=30)
+SEARCH_AHEAD = timedelta(days=365)
+NOT_FOUND_TEXT = (
+    "Задача не найдена. Попробуйте уточнить запрос: укажите слово из названия, дату или период — "
+    "например, «когда встреча с Анной?» или «что у меня в пятницу?»"
+)
+EDIT_PROMPTS = {
+    "title": "Напишите новое название",
+    "date": "Напишите новую дату: «завтра», «в пятницу», «через 2 дня», «15 октября»",
+    "time": "Напишите новое время: «18:00», «с 10 до 12» — или «без времени»",
+}
+CANCEL_WORDS = {"отмена", "отменить", "стоп", "/cancel"}
+NO_TIME_WORDS = re.compile(r"^\s*(без\s+времени|весь\s+день|убрать(\s+время)?|нет|не\s+важно|любое)\s*\.?\s*$", re.I)
 
 QUESTION_PREFIXES = (
     "что ", "что?", "какие ", "какая ", "какой ", "покажи", "есть ли ", "когда ", "во сколько ", "где у меня",
-    "план ", "планы", "план?", "расписание", "мои ", "мой ", "сколько у меня",
+    "план ", "планы", "план?", "расписание", "мои ", "мой ", "сколько у меня", "найди ", "найти ", "где ",
 )
 STOP_WORDS = {
-    "что", "есть", "ли", "у", "меня", "мне", "мои", "мой", "план", "планы", "планов", "планах", "какие", "какая",
-    "какой", "покажи", "когда", "сколько", "расписание", "сегодня", "завтра", "послезавтра", "через", "неделю",
-    "неделе", "недели", "месяц", "месяца", "день", "дня", "дней", "будет", "было", "нужно", "должен", "должна",
-    "утром", "днем", "днём", "вечером", "ночью", "события", "событие", "событий", "дела", "делам",
-    "выходные", "выходных", "выходным", "этой", "следующей", "следующую",
+    "что", "есть", "ли", "у", "меня", "мне", "мои", "мой", "моя", "моё", "мое", "план", "планы", "планов", "планах",
+    "какие", "какая", "какой", "покажи", "показать", "когда", "сколько", "расписание", "сегодня", "завтра", "послезавтра",
+    "через", "неделю", "неделе", "недели", "месяц", "месяца", "день", "дня", "дней", "будет", "было", "была", "был",
+    "нужно", "надо", "должен", "должна", "утром", "днем", "днём", "вечером", "ночью", "события", "событие", "событий",
+    "дела", "делам", "дело", "выходные", "выходных", "выходным", "этой", "этот", "эту", "следующей", "следующую",
+    "следующий", "задача", "задачу", "задачи", "задач", "задаче", "найди", "найти", "где", "во", "запланировано",
+    "запланирована", "запланирован", "назначено", "назначена", "назначен", "время", "часов", "пожалуйста", "напомни",
+    "все", "всё", "всех", "list", "about",
 }
-WEEKDAY_PATTERNS = (
-    (0, r"понедельн\w*|пн"),
-    (1, r"вторник\w*|вт"),
-    (2, r"сред[ауеы]|ср"),
-    (3, r"четверг\w*|чт"),
-    (4, r"пятниц\w*|пт"),
-    (5, r"суббот\w*|сб"),
-    (6, r"воскресень\w*|вс"),
-)
+_stemmer = snowballstemmer.stemmer("russian")
 
 
 class AssistantUnavailable(Exception):
     pass
 
 
-def event_view(event: Event, tz: ZoneInfo, repeats: int = 0) -> dict:
-    return {
-        "id": event.id,
-        "title": event.title,
-        "start": event.start_at.astimezone(tz).isoformat(),
-        "end": event.end_at.astimezone(tz).isoformat(),
-        "all_day": event.all_day,
-        "location": event.location,
-        "description": event.description,
-        "priority": event.priority,
-        "reminder_minutes": event.reminder_minutes,
-        "repeats": repeats,
-        "url": f"{settings.public_app_url}/app/events/{event.id}" if settings.public_app_url else None,
-    }
+class DraftNotFound(Exception):
+    pass
 
 
-def group_by_day(events: list[Event], tz: ZoneInfo, today: date) -> list[dict]:
-    days: dict[date, list[dict]] = {}
-    for event in sorted(events, key=lambda item: item.start_at):
-        days.setdefault(event.start_at.astimezone(tz).date(), []).append(event_view(event, tz))
-    return [{"date": day.isoformat(), "label": day_label(day, today), "events": items} for day, items in sorted(days.items())]
+# ---------- conversation memory ----------
 
 
 async def remember(session: AsyncSession, user_id: int, role: str, content: str) -> None:
@@ -88,35 +81,45 @@ async def recent_context(session: AsyncSession, user_id: int) -> str:
     return "\n".join(f"{row.role}: {row.content[:1200]}" for row in reversed(list(rows)))
 
 
+# ---------- agenda and search ----------
+
+
+def event_view(event: Event, tz: ZoneInfo, repeats: int = 0) -> dict:
+    view = tasks.task_view(event, tz)
+    view["repeats"] = repeats
+    view["url"] = f"{settings.public_app_url}/app/events/{event.id}" if settings.public_app_url else None
+    return view
+
+
+def group_by_day(events: list[Event], tz: ZoneInfo, today: date) -> list[dict]:
+    days: dict[date, list[dict]] = {}
+    for event in sorted(events, key=lambda item: (item.start_at.astimezone(tz).date(), not item.all_day, item.start_at)):
+        days.setdefault(event.start_at.astimezone(tz).date(), []).append(event_view(event, tz))
+    return [{"date": day.isoformat(), "label": day_label(day, today), "events": items} for day, items in sorted(days.items())]
+
+
 def is_question(text: str) -> bool:
     lowered = " ".join(text.lower().split())
     return lowered.startswith(QUESTION_PREFIXES) or bool(re.search(r"\bчто у меня\b|\bкогда у меня\b|\bчем я занят", lowered))
 
 
-def requested_weekday(text: str) -> int | None:
-    lowered = text.lower()
-    for weekday, pattern in WEEKDAY_PATTERNS:
-        if re.search(rf"(?<![а-яё])(?:{pattern})(?![а-яё])", lowered):
-            return weekday
-    return None
-
-
 def search_keywords(text: str) -> list[str]:
-    words = re.findall(r"[а-яёa-z0-9]+", text.lower())
-    return [word[:5] for word in words if len(word) >= 4 and word not in STOP_WORDS][:6]
+    stems = []
+    for word in re.findall(r"[а-яёa-z0-9]+", text.lower().replace("ё", "е")):
+        if len(word) < 3 or word in STOP_WORDS or word.isdigit():
+            continue
+        stem = _stemmer.stemWord(word)
+        if len(stem) >= 3 and stem not in stems:
+            stems.append(stem)
+    return stems[:5]
 
 
 def local_filters(text: str, tz: ZoneInfo) -> dict | None:
     lowered = text.lower()
-    today = datetime.now(tz).date()
+    now = datetime.now(tz)
+    today = now.date()
     date_from = date_to = None
-    if "послезавтра" in lowered:
-        date_from = date_to = today + timedelta(days=2)
-    elif "завтра" in lowered:
-        date_from = date_to = today + timedelta(days=1)
-    elif "сегодня" in lowered:
-        date_from = date_to = today
-    elif re.search(r"на (этой|эту) недел|на неделе|за неделю", lowered):
+    if re.search(r"на (этой|эту) недел|на неделе|за неделю", lowered):
         date_from, date_to = today, today + timedelta(days=6 - today.weekday())
     elif "следующей недел" in lowered or "следующую неделю" in lowered:
         start = today + timedelta(days=7 - today.weekday())
@@ -124,12 +127,9 @@ def local_filters(text: str, tz: ZoneInfo) -> dict | None:
     elif "выходн" in lowered:
         saturday = today + timedelta(days=(5 - today.weekday()) % 7)
         date_from, date_to = saturday, saturday + timedelta(days=1)
-    elif match := re.search(r"через\s+(\d+)\s+(дн\w*|недел\w*|месяц\w*)", lowered):
-        amount, unit = int(match.group(1)), match.group(2)
-        target = today + (timedelta(days=amount) if unit.startswith("дн") else timedelta(weeks=amount) if unit.startswith("недел") else relativedelta(months=amount))
-        date_from = date_to = target
-    elif (weekday := requested_weekday(text)) is not None:
-        date_from = date_to = today + timedelta(days=(weekday - today.weekday()) % 7)
+    else:
+        parsed = dates.parse(text, now)
+        date_from = date_to = parsed.date
     time_from = time_to = None
     if "утр" in lowered:
         time_from, time_to = time(5), time(12)
@@ -137,7 +137,7 @@ def local_filters(text: str, tz: ZoneInfo) -> dict | None:
         time_from, time_to = time(12), time(18)
     elif "вечер" in lowered:
         time_from, time_to = time(18), time(23, 59, 59)
-    keywords = search_keywords(text)
+    keywords = search_keywords(dates.strip_spans(text, dates.parse(text, now).spans))
     if not (date_from or time_from or keywords):
         return None
     return {"date_from": date_from, "date_to": date_to, "time_from": time_from, "time_to": time_to, "keywords": keywords}
@@ -156,13 +156,13 @@ def coerce_filters(raw: dict) -> dict:
         except ValueError:
             return None
 
-    keywords = [str(word)[:40] for word in raw.get("keywords") or [] if isinstance(word, str) and word.strip()][:6]
+    words = " ".join(str(word) for word in raw.get("keywords") or [] if isinstance(word, str))
     return {
         "date_from": as_date(raw.get("date_from")),
         "date_to": as_date(raw.get("date_to")),
         "time_from": as_time(raw.get("time_from")),
         "time_to": as_time(raw.get("time_to")),
-        "keywords": keywords,
+        "keywords": search_keywords(words),
     }
 
 
@@ -185,47 +185,53 @@ async def search(session: AsyncSession, user: User, text: str, tz: ZoneInfo) -> 
             filters = coerce_filters(await GigaChatClient().extract_search_filters(text, str(tz)))
         except Exception:
             logger.exception("GigaChat search filters failed")
-    filters = filters or {"date_from": None, "date_to": None, "time_from": None, "time_to": None, "keywords": []}
+    if not filters or not (filters["date_from"] or filters["time_from"] or filters["keywords"]):
+        # Nothing to search by: ask to refine instead of dumping every task
+        return {"kind": "not_found", "text": NOT_FOUND_TEXT}
     now = datetime.now(tz)
-    since = datetime.combine(filters["date_from"], time.min, tz) if filters["date_from"] else now - timedelta(hours=12)
-    until = datetime.combine(filters["date_to"] + timedelta(days=1), time.min, tz) if filters["date_to"] else since + timedelta(days=60)
-    conditions = [Event.user_id == user.id, Event.start_at.is_not(None), Event.start_at < until, Event.end_at > since]
-    if filters["keywords"] and not filters["date_from"]:
-        conditions.append(or_(*[column.ilike(f"%{word}%") for word in filters["keywords"] for column in (Event.title, Event.description, Event.location)]))
+    if filters["date_from"]:
+        since = datetime.combine(filters["date_from"], time.min, tz)
+        until = datetime.combine((filters["date_to"] or filters["date_from"]) + timedelta(days=1), time.min, tz)
+    elif filters["keywords"]:
+        since, until = now - SEARCH_PAST, now + SEARCH_AHEAD
+    else:
+        since, until = now - timedelta(hours=12), now + timedelta(days=7)
+    conditions = [Event.user_id == user.id, Event.start_at < until, Event.end_at > since]
+    searchable = func.lower(func.concat_ws(" ", Event.title, func.coalesce(Event.description, ""), func.coalesce(Event.location, "")))
+    for stem in filters["keywords"]:
+        conditions.append(func.replace(searchable, "ё", "е").contains(stem))
     events = list(await session.scalars(select(Event).where(*conditions).order_by(Event.start_at).limit(100)))
     if filters["time_from"] or filters["time_to"]:
         events = [
             event
             for event in events
-            if (not filters["time_from"] or event.start_at.astimezone(tz).time() >= filters["time_from"])
+            if not event.all_day
+            and (not filters["time_from"] or event.start_at.astimezone(tz).time() >= filters["time_from"])
             and (not filters["time_to"] or event.start_at.astimezone(tz).time() < filters["time_to"])
         ]
+    if not events and filters["keywords"]:
+        return {"kind": "not_found", "text": NOT_FOUND_TEXT}
     single_day = filters["date_from"] if filters["date_from"] and filters["date_from"] == filters["date_to"] else None
     return {
         "kind": "agenda",
-        "title": search_title(filters, now.date()),
+        "title": search_title(filters, now.date()) if filters["date_from"] else "Найденные события",
         "date": single_day.isoformat() if single_day else None,
         "days": group_by_day(events, tz, now.date()),
     }
 
 
 async def agenda(session: AsyncSession, user: User, scope: str) -> dict:
-    tz = ZoneInfo(user_timezone(user))
+    tz = tasks.local_tz(user)
     today = datetime.now(tz).date()
     first = today + timedelta(days=1) if scope == "tomorrow" else today
     length = 7 if scope == "week" else 1
     start = datetime.combine(first, time.min, tz)
-    end = start + timedelta(days=length)
-    events = list(
-        await session.scalars(
-            select(Event)
-            .where(Event.user_id == user.id, Event.start_at.is_not(None), Event.start_at < end, Event.end_at > start)
-            .order_by(Event.start_at)
-            .limit(200)
-        )
-    )
+    events = await tasks.events_between(session, user, start, start + timedelta(days=length), limit=200)
     titles = {"today": "Сегодня", "tomorrow": "Завтра", "week": "Ближайшие 7 дней"}
     return {"kind": "agenda", "scope": scope, "title": titles.get(scope, "План"), "date": first.isoformat(), "days": group_by_day(events, tz, today)}
+
+
+# ---------- turning model output into draft items ----------
 
 
 def grounded(item: dict, text: str) -> bool:
@@ -234,115 +240,380 @@ def grounded(item: dict, text: str) -> bool:
     return any(word[:4] in request for word in re.findall(r"[а-яёa-z]+", event_text) if len(word) >= 4)
 
 
-def parse_moment(value, tz: ZoneInfo) -> datetime | None:
-    if not isinstance(value, str) or not value.strip():
+def _llm_date(raw: dict) -> date | None:
+    for key in ("date", "starts_at"):
+        value = raw.get(key)
+        if isinstance(value, str) and len(value) >= 10:
+            try:
+                return date.fromisoformat(value[:10])
+            except ValueError:
+                continue
+    return None
+
+
+def _llm_time(raw: dict, key: str) -> time | None:
+    value = raw.get(key)
+    if key == "start_time" and not value and isinstance(raw.get("starts_at"), str) and "T" in raw["starts_at"]:
+        value = raw["starts_at"].split("T", 1)[1][:5]
+    if not isinstance(value, str):
         return None
     try:
-        moment = datetime.fromisoformat(value.strip())
+        return time.fromisoformat(value.strip()[:5])
     except ValueError:
         return None
-    return moment.replace(tzinfo=tz) if moment.tzinfo is None else moment
 
 
-def occurrences(start: datetime, rule: str | None) -> list[datetime]:
-    if not isinstance(rule, str) or not rule.strip():
-        return [start]
-    try:
-        series = rrulestr(rule.strip().removeprefix("RRULE:"), dtstart=start)
-    except (TypeError, ValueError):
-        return [start]
-    found = []
-    for moment in series:
-        if moment > start + RECURRENCE_WINDOW or len(found) >= MAX_OCCURRENCES:
-            break
-        found.append(moment)
-    return found or [start]
+def mentions_time(text: str) -> bool:
+    return bool(re.search(r"\d{1,2}[:.]\d{2}|\b(?:в|к|с)\s+\d{1,2}\b|полдень|полночь|половин|через\s+\S*\s*(?:минут|час|полчаса)", text.lower()))
 
 
-async def create_events(session: AsyncSession, user: User, items: list[dict], tz: ZoneInfo) -> tuple[list[dict], list[int]]:
-    tz_name = str(tz)
-    calendar = await default_calendar(session, user, tz_name)
-    series: list[list[Event]] = []
-    for item in items:
-        title = str(item.get("title") or "").strip()[:300]
-        start = parse_moment(item.get("starts_at"), tz)
-        if not title or not start:
-            continue
-        end = parse_moment(item.get("ends_at"), tz)
-        duration = end - start if end and end > start else timedelta(hours=1)
-        reminder = item.get("reminder_minutes")
-        if not isinstance(reminder, int) or isinstance(reminder, bool) or not 0 <= reminder <= MAX_REMINDER_MINUTES:
-            reminder = None
-        location = str(item["location"]).strip()[:500] if item.get("location") else None
-        description = str(item["description"]).strip() if item.get("description") else None
-        created = []
-        for moment in occurrences(start, item.get("recurrence_rule")):
-            event = Event(
-                calendar_id=calendar.id,
-                user_id=user.id,
-                title=title,
-                description=description,
-                start_at=moment,
-                end_at=moment + duration,
-                timezone=tz_name,
-                location=location,
-                reminder_minutes=reminder,
-                source="ai",
-            )
-            session.add(event)
-            created.append(event)
-        series.append(created)
-    if not series:
-        return [], []
+def build_item(title: str, parsed: dates.Parsed, now: datetime, llm: dict | None = None, allow_llm_time: bool = False) -> dict | None:
+    """A draft item with a concrete date. A task without a stated time stays untimed instead of getting 09:00."""
+    llm = llm or {}
+    title = " ".join(str(title or "").split()).strip()[:300]
+    if not title:
+        return None
+    today = now.date()
+    llm_day = _llm_date(llm)
+    day = parsed.date or (llm_day if llm_day and llm_day >= today else None)
+    start = parsed.time if parsed.time is not None else (_llm_time(llm, "start_time") if allow_llm_time else None)
+    end = parsed.end_time if parsed.time is not None and parsed.end_time else (_llm_time(llm, "end_time") if allow_llm_time else None)
+    duration = llm.get("duration_minutes")
+    if start and not end and isinstance(duration, int) and not isinstance(duration, bool) and 0 < duration <= 24 * 60:
+        end = (datetime.combine(today, start) + timedelta(minutes=duration)).time()
+        end = end if end > start else None
+    rule = parsed.rrule or (dates.valid_rrule(llm.get("recurrence_rule")) if llm.get("recurrence_phrase") else None)
+    if day is None:
+        day = today + timedelta(days=1) if start and start <= now.time() and not rule else today
+    if rule:
+        first = dates.first_occurrence(rule, datetime.combine(day, start or time.min, now.tzinfo), now)
+        if first is None:
+            rule = None
+        else:
+            day = first.date()
+    reminder = llm.get("reminder_minutes")
+    return {
+        "title": title,
+        "date": day.isoformat(),
+        "time": start.strftime("%H:%M") if start else None,
+        "end_time": end.strftime("%H:%M") if start and end and end > start else None,
+        "rrule": rule,
+        "location": str(llm["location"]).strip()[:500] if llm.get("location") else None,
+        "description": str(llm["description"]).strip()[:2000] if llm.get("description") else None,
+        "reminder_minutes": reminder if isinstance(reminder, int) and not isinstance(reminder, bool) and 0 <= reminder <= tasks.MAX_REMINDER_MINUTES else None,
+    }
+
+
+def normalize_item(raw: dict, text: str, now: datetime, single: bool) -> dict | None:
+    phrases = [raw.get(key) for key in ("date_phrase", "time_phrase", "recurrence_phrase")]
+    phrase = " ".join(value for value in phrases if isinstance(value, str) and value.strip())
+    parsed = dates.parse(phrase, now) if phrase else dates.Parsed()
+    if single:
+        # With one task the whole message is about it, so phrases the model missed still count
+        whole = dates.parse(text, now)
+        parsed.date = parsed.date or whole.date
+        parsed.rrule = parsed.rrule or whole.rrule
+        if parsed.time is None:
+            parsed.time, parsed.end_time = whole.time, whole.end_time
+    return build_item(str(raw.get("title") or ""), parsed, now, raw, allow_llm_time=bool(raw.get("time_phrase")) or mentions_time(text))
+
+
+FILLER = re.compile(
+    r"^(?:(?:пожалуйста|напомни(?:те)?|напоминание|мне|надо|нужно|запиши|запланируй|добавь|поставь|создай(?:\s+задачу)?|задача|задачу|что|о том,?\s*что)\s*[:,]?\s+)+",
+    re.I,
+)
+
+
+def clean_title(value: str) -> str:
+    value = " ".join(str(value or "").split()).strip(" ,.;:—-")
+    value = FILLER.sub("", value).strip(" ,.;:—-")
+    value = re.sub(r"\s+(?:в|во|на|к|с|до)$", "", value, flags=re.I).strip(" ,.;:—-")
+    return (value[:1].upper() + value[1:])[:300] if value else ""
+
+
+def local_items(text: str, now: datetime) -> list[dict]:
+    """Parse a short single task without the model: "купить хлеб завтра в 18:00"."""
+    if len(text) > LOCAL_TEXT_LIMIT or "\n" in text.strip():
+        return []
+    parsed = dates.parse(text, now)
+    if parsed.empty:
+        return []
+    item = build_item(clean_title(dates.strip_spans(text, parsed.spans)), parsed, now)
+    return [item] if item else []
+
+
+# ---------- drafts: the confirmation stage ----------
+
+
+def item_view(item: dict, index: int, tz: ZoneInfo) -> dict:
+    day = date.fromisoformat(item["date"])
+    start, end, all_day = tasks.event_bounds(
+        day,
+        time.fromisoformat(item["time"]) if item.get("time") else None,
+        time.fromisoformat(item["end_time"]) if item.get("end_time") else None,
+        tz,
+    )
+    return {
+        **item,
+        "index": index,
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "all_day": all_day,
+        "recurrence": dates.describe_rrule(item.get("rrule")),
+    }
+
+
+def proposal(draft: AssistantDraft, tz: ZoneInfo, answer: str | None = None, note: str | None = None) -> dict:
+    return {
+        "kind": "proposal",
+        "draft_id": draft.id,
+        "events": [item_view(item, index, tz) for index, item in enumerate(draft.items)],
+        "answer": answer,
+        "note": note,
+        "awaiting": draft.awaiting,
+    }
+
+
+async def create_draft(session: AsyncSession, user: User, items: list[dict]) -> AssistantDraft:
+    await session.execute(
+        delete(AssistantDraft).where(AssistantDraft.user_id == user.id, AssistantDraft.created_at < datetime.now(timezone.utc) - DRAFT_LIFETIME)
+    )
+    # Only the newest draft can wait for an edit
+    drafts = await session.scalars(select(AssistantDraft).where(AssistantDraft.user_id == user.id, AssistantDraft.awaiting.is_not(None)))
+    for old in drafts:
+        old.awaiting = None
+    draft = AssistantDraft(user_id=user.id, items=items[:MAX_DRAFT_ITEMS], awaiting=None)
+    session.add(draft)
     await session.commit()
-    all_events = [event for group in series for event in group]
-    for event in all_events:
-        await session.refresh(event)
-    await push_new_events_to_google(session, user.id, all_events)
-    return [event_view(group[0], tz, repeats=len(group) - 1) for group in series], [event.id for event in all_events]
+    await session.refresh(draft)
+    return draft
+
+
+async def get_draft(session: AsyncSession, user: User, draft_id: int) -> AssistantDraft:
+    draft = await session.get(AssistantDraft, draft_id)
+    if not draft or draft.user_id != user.id:
+        raise DraftNotFound
+    return draft
+
+
+async def pending_edit(session: AsyncSession, user: User) -> AssistantDraft | None:
+    since = datetime.now(timezone.utc) - EDIT_TIMEOUT
+    return await session.scalar(
+        select(AssistantDraft)
+        .where(AssistantDraft.user_id == user.id, AssistantDraft.awaiting.is_not(None), AssistantDraft.updated_at >= since)
+        .order_by(AssistantDraft.updated_at.desc())
+        .limit(1)
+    )
+
+
+async def begin_edit(session: AsyncSession, user: User, draft_id: int, index: int, field: str) -> dict:
+    draft = await get_draft(session, user, draft_id)
+    if field not in EDIT_PROMPTS or not 0 <= index < len(draft.items):
+        raise DraftNotFound
+    await session.execute(
+        AssistantDraft.__table__.update().where(AssistantDraft.user_id == user.id, AssistantDraft.id != draft.id).values(awaiting=None)
+    )
+    draft.awaiting = {"index": index, "field": field}
+    await session.commit()
+    return {"prompt": EDIT_PROMPTS[field], "title": draft.items[index]["title"], "field": field, "index": index}
+
+
+def edit_item(item: dict, field: str, value: str, now: datetime) -> tuple[dict | None, str | None]:
+    """The item with one field changed from free text, or an error message."""
+    item = dict(item)
+    if field == "title":
+        title = " ".join(value.split())[:300]
+        if not title:
+            return None, "Название не может быть пустым"
+        item["title"] = title
+    elif field == "date":
+        parsed = dates.parse(value, now)
+        if parsed.date is None and parsed.rrule is None:
+            return None, "Не поняла дату. Напишите, например: «завтра», «в пятницу», «через 2 дня», «15 октября»"
+        current_time = time.fromisoformat(item["time"]) if item.get("time") else None
+        if parsed.time is not None:
+            item["time"], item["end_time"] = parsed.time.strftime("%H:%M"), parsed.end_time.strftime("%H:%M") if parsed.end_time else None
+            current_time = parsed.time
+        if parsed.rrule:
+            item["rrule"] = parsed.rrule
+            first = dates.first_occurrence(parsed.rrule, datetime.combine(parsed.date or now.date(), current_time or time.min, now.tzinfo), now)
+            item["date"] = (first.date() if first else parsed.date or now.date()).isoformat()
+        else:
+            item["rrule"] = None
+            item["date"] = parsed.date.isoformat()
+    elif field == "time":
+        if NO_TIME_WORDS.match(value):
+            item["time"] = item["end_time"] = None
+            return item, None
+        candidate = value.strip()
+        if re.match(r"^\d", candidate):
+            candidate = ("с " if re.search(r"\d\s*(?:-|–|—|до)\s*\d", candidate) else "в ") + candidate
+        start, end, _ = dates.parse_time(candidate)
+        if start is None:
+            return None, "Не поняла время. Напишите, например: «18:00», «в 9 утра», «с 10 до 12» или «без времени»"
+        item["time"] = start.strftime("%H:%M")
+        item["end_time"] = end.strftime("%H:%M") if end else None
+    return item, None
+
+
+async def apply_edit_text(session: AsyncSession, user: User, draft: AssistantDraft, text: str, tz: ZoneInfo) -> dict:
+    awaiting = draft.awaiting or {}
+    if text.strip().lower() in CANCEL_WORDS:
+        draft.awaiting = None
+        await session.commit()
+        return proposal(draft, tz, note="Изменение отменено")
+    index, field = awaiting.get("index"), awaiting.get("field")
+    if not isinstance(index, int) or not 0 <= index < len(draft.items):
+        draft.awaiting = None
+        await session.commit()
+        return proposal(draft, tz)
+    item, error = edit_item(draft.items[index], field, text, datetime.now(tz))
+    if error:
+        return {"kind": "edit_error", "text": error, "draft_id": draft.id, "awaiting": awaiting}
+    items = list(draft.items)
+    items[index] = item
+    draft.items = items
+    draft.awaiting = None
+    await session.commit()
+    return proposal(draft, tz, note="Изменено ✓")
+
+
+def validate_item(raw: dict, now: datetime) -> dict | None:
+    """An item edited in the web form: same fields as a draft item, validated."""
+    try:
+        day = date.fromisoformat(str(raw.get("date")))
+        start = time.fromisoformat(raw["time"]) if raw.get("time") else None
+        end = time.fromisoformat(raw["end_time"]) if raw.get("end_time") and start else None
+    except (TypeError, ValueError):
+        return None
+    parsed = dates.Parsed(date=day, time=start, end_time=end, rrule=dates.valid_rrule(raw.get("rrule")))
+    item = build_item(str(raw.get("title") or ""), parsed, now, raw)
+    if item and not raw.get("rrule"):
+        item["date"] = day.isoformat()  # an explicit date from the form is kept even if it is in the past
+    return item
+
+
+async def replace_items(session: AsyncSession, user: User, draft_id: int, items: list[dict]) -> dict:
+    draft = await get_draft(session, user, draft_id)
+    tz = tasks.local_tz(user)
+    now = datetime.now(tz)
+    cleaned = [item for item in (validate_item(raw, now) for raw in items[:MAX_DRAFT_ITEMS]) if item]
+    if not cleaned:
+        raise ValueError("Нужна хотя бы одна задача с названием и датой")
+    draft.items = cleaned
+    draft.awaiting = None
+    await session.commit()
+    return proposal(draft, tz)
+
+
+async def remove_item(session: AsyncSession, user: User, draft_id: int, index: int) -> dict:
+    draft = await get_draft(session, user, draft_id)
+    tz = tasks.local_tz(user)
+    if 0 <= index < len(draft.items):
+        draft.items = [item for position, item in enumerate(draft.items) if position != index]
+    draft.awaiting = None
+    if not draft.items:
+        await session.delete(draft)
+        await session.commit()
+        return {"kind": "cancelled", "text": "Черновик пуст — ничего не добавлено"}
+    await session.commit()
+    return proposal(draft, tz, note="Удалено из черновика")
+
+
+async def confirm_draft(session: AsyncSession, user: User, draft_id: int) -> dict:
+    draft = await get_draft(session, user, draft_id)
+    tz = tasks.local_tz(user)
+    items = list(draft.items)
+    await session.delete(draft)
+    await session.flush()
+    firsts, ids = await tasks.create_tasks(session, user, items)
+    counts: dict[str | None, int] = {}
+    if any(event.series_id for event in firsts):
+        rows = await session.execute(
+            select(Event.series_id, func.count()).where(Event.series_id.in_([event.series_id for event in firsts if event.series_id])).group_by(Event.series_id)
+        )
+        counts = dict(rows.all())
+    reply = {
+        "kind": "created",
+        "events": [event_view(event, tz, repeats=max(0, counts.get(event.series_id, 1) - 1)) for event in firsts],
+        "event_ids": ids,
+        "answer": None,
+    }
+    await remember(session, user.id, "assistant", summarize(reply))
+    await session.commit()
+    return reply
+
+
+async def cancel_draft(session: AsyncSession, user: User, draft_id: int) -> dict:
+    draft = await get_draft(session, user, draft_id)
+    await session.delete(draft)
+    await session.commit()
+    return {"kind": "cancelled", "text": "Хорошо, ничего не добавляю"}
+
+
+# ---------- entry point ----------
 
 
 def summarize(reply: dict) -> str:
-    if reply["kind"] == "created":
+    kind = reply["kind"]
+    if kind == "created":
         return "Добавила в календарь: " + "; ".join(f"{event['title']} ({event['start']})" for event in reply["events"])
-    if reply["kind"] == "agenda":
+    if kind == "proposal":
+        return "Предложила добавить: " + "; ".join(f"{event['title']} ({event['start']})" for event in reply["events"])
+    if kind == "agenda":
         count = sum(len(day["events"]) for day in reply["days"])
         return f"Показала события ({reply['title']}): {count}"
     return reply.get("text") or "Не нашла событий в сообщении"
 
 
+async def extract_items(text: str, tz: ZoneInfo, history: str) -> tuple[list[dict], str | None]:
+    now = datetime.now(tz)
+    if not settings.gigachat_credentials:
+        items = local_items(text, now)
+        if not items:
+            raise AssistantUnavailable
+        return items, None
+    from services.gigachat import GigaChatClient
+
+    try:
+        result = await GigaChatClient().process_message(text, str(tz), history)
+    except Exception as error:
+        logger.exception("GigaChat request failed")
+        items = local_items(text, now)
+        if not items:
+            raise AssistantUnavailable from error
+        return items, None
+    raw = [item for item in result.get("events", []) if isinstance(item, dict)]
+    if history:
+        raw = [item for item in raw if grounded(item, text)]
+    items = [item for item in (normalize_item(item, text, now, len(raw) == 1) for item in raw) if item]
+    if not items and not result.get("answer"):
+        items = local_items(text, now)
+    return items, result.get("answer")
+
+
 async def handle_message(session: AsyncSession, user: User, text: str) -> dict:
-    tz = ZoneInfo(user_timezone(user))
+    tz = tasks.local_tz(user)
     text = text.strip()[:50000]
     history = await recent_context(session, user.id)
-    if is_question(text):
+    draft = await pending_edit(session, user)
+    if draft:
+        reply = await apply_edit_text(session, user, draft, text, tz)
+    elif is_question(text):
         reply = await search(session, user, text, tz)
     else:
-        if not settings.gigachat_credentials:
-            raise AssistantUnavailable
-        from services.gigachat import GigaChatClient
-
-        try:
-            result = await GigaChatClient().process_message(text, str(tz), history)
-        except Exception as error:
-            logger.exception("GigaChat request failed")
-            raise AssistantUnavailable from error
-        items = [item for item in result.get("events", []) if isinstance(item, dict)]
-        if history:
-            items = [item for item in items if grounded(item, text)]
-        events, ids = await create_events(session, user, items, tz)
-        answer = result.get("answer")
-        if not events and not answer:
-            try:
-                answer = await GigaChatClient().chat_reply(text, str(tz), history, user.name)
-            except Exception:
-                logger.exception("GigaChat chat reply failed")
-        if events:
-            reply = {"kind": "created", "events": events, "event_ids": ids, "answer": answer}
-        elif answer:
-            reply = {"kind": "answer", "text": answer}
+        items, answer = await extract_items(text, tz, history)
+        if items:
+            reply = proposal(await create_draft(session, user, items), tz, answer=answer)
         else:
-            reply = {"kind": "nothing"}
+            if not answer and settings.gigachat_credentials:
+                from services.gigachat import GigaChatClient
+
+                try:
+                    answer = await GigaChatClient().chat_reply(text, str(tz), history, user.name)
+                except Exception:
+                    logger.exception("GigaChat chat reply failed")
+            reply = {"kind": "answer", "text": answer} if answer else {"kind": "nothing"}
     await remember(session, user.id, "user", text)
     await remember(session, user.id, "assistant", summarize(reply))
     await session.commit()

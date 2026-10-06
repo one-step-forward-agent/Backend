@@ -11,7 +11,11 @@ Backend for Focus Day, a calendar assistant built on FastAPI. It stores users, c
 - **Google Calendar**: OAuth login, two-way sync of events and calendars.
 - **Export**: `.ics` export of the user's calendar.
 - **Auth**: email/password registration with Argon2 hashing. Short-lived JWT access tokens plus refresh tokens, sent either as `Authorization: Bearer` or as httpOnly cookies. Every `/api` route is scoped to the current user.
-- **Integrations**: Google Calendar (OAuth), Apple Calendar (iCloud/any CalDAV, app-specific password), Jira Cloud (email + API token), Notion (internal integration token + database), Obsidian (Local REST API plugin). Each one supports test, import (sync) into the local calendar, and export of local events. Credentials are Fernet-encrypted.
+- **Integrations**: Google Calendar (OAuth), Apple Calendar (iCloud/any CalDAV, app-specific password), Jira Cloud (email + API token), Notion (internal integration token + database). Each one supports test, import (sync) into the local calendar, and export of local events. Credentials are Fernet-encrypted.
+- **Tasks**: a task without a stated time is stored as an untimed (all-day) task instead of getting a default time. Recurring tasks ("каждую пятницу в 18:00", "по будням") become a series that is kept filled 90 days ahead. Tasks can be marked completed; `/api/stats` returns daily completion statistics.
+- **Dates**: `app/services/dates.py` resolves Russian date, time and recurrence phrases ("в следующую пятницу", "через два дня", "по вторникам") with `datetime`. GigaChat only reports the phrases it found for each event.
+- **Confirmation stage**: the assistant never creates events right away. It saves a draft that the user can edit (title, date, time, remove items) and then confirms or cancels. This works on the site and in the bot.
+- **Midday check-in and recommendations**: the onboarding answers (`PUT /api/me/onboarding`: work days and hours, goals, tone) are used for the midday check-in in Telegram, which suggests tasks to move to a less busy day, and for the two AI recommendations on the main screen.
 - **Reminders**: per-user settings (lead times, per-event override, daily digest, quiet hours, source filter). The backend queues notifications in an outbox and the Telegram bot delivers them.
 
 ## Tech stack
@@ -51,7 +55,7 @@ Copy `.env.example` to `.env` and fill in the values:
 | `COOKIE_SECURE` | Mark auth cookies `Secure` (set `true` behind HTTPS) |
 | `CORS_ORIGINS` | Comma-separated extra browser origins allowed to call the API. Empty (default) means same-origin only. `*` is rejected |
 | `ENABLE_DOCS` | Swagger UI and `/openapi.json` (default: on in development, off in production) |
-| `ALLOW_PRIVATE_INTEGRATION_URLS` | Let Jira, CalDAV and Obsidian URLs point to private or loopback addresses (default: on in development, off in production) |
+| `ALLOW_PRIVATE_INTEGRATION_URLS` | Let Jira and CalDAV URLs point to private or loopback addresses (default: on in development, off in production) |
 | `GIGACHAT_CA_BUNDLE` | PEM file with the Russian Trusted Root CA, used to verify GigaChat's TLS certificate |
 | `INTEGRATIONS_ENCRYPTION_KEY` | Fernet key for integration credentials; derived from `SECRET_KEY` if empty |
 | `BOT_API_TOKEN` | Shared secret for the bot's `/internal/bot/*` API (same value in `tg_bot/.env`) |
@@ -109,23 +113,28 @@ Interactive docs are served at `/docs` (Swagger) and `/redoc`.
 | Health | `GET /health` |
 | Auth | `POST /auth/register`, `POST /auth/login`, `POST /auth/token` (OAuth2 form, for Swagger), `POST /auth/refresh`, `POST /auth/logout` |
 | Google OAuth | `GET /auth/google/login`, `GET /auth/google/callback`, `POST /auth/google/disconnect` |
-| Profile | `GET/PATCH /api/me` |
+| Profile | `GET/PATCH /api/me`, `PUT /api/me/onboarding` |
 | Calendars | `GET/POST /api/calendars`, `GET /api/calendars/{id}`, `POST /api/calendars/{id}/sync` |
-| Events | `GET/POST /api/events`, `GET/PUT/DELETE /api/events/{id}`, `POST /api/events/{id}/sync/google`, `GET /api/events/{id}/links` |
+| Events | `GET/POST /api/events` (`recurrence_rule` creates a series), `GET/PUT/DELETE /api/events/{id}` (`?scope=series` deletes this and later occurrences), `POST /api/events/{id}/complete`, `POST /api/events/move`, `POST /api/events/{id}/sync/google`, `GET /api/events/{id}/links` |
+| Statistics | `GET /api/stats?days=7`, `GET /api/recommendations` |
 | Integrations | `GET /api/integrations`, `POST /api/integrations/{provider}/connect`, `.../test`, `.../sync`, `POST /api/integrations/{provider}/export/{event_id}`, `DELETE /api/integrations/{provider}?purge=` |
 | Reminders | `GET/PUT /api/reminders/settings`, `POST /api/reminders/test`, `GET /api/reminders/history` |
 | Telegram | `GET/DELETE /api/telegram`, `POST /api/telegram/link` |
-| Bot (internal, `X-Bot-Token`) | `/internal/bot/link`, `/unlink/{chat_id}`, `/users/{chat_id}/reminder-settings`, `/notifications/claim`, `/notifications/{id}/ack` |
+| Bot (internal, `X-Bot-Token`) | `/internal/bot/link`, `/unlink/{chat_id}`, `/users/{chat_id}/reminder-settings`, `/chat/{chat_id}` (message → proposal, agenda or answer), `/chat/{chat_id}/drafts/{id}` (+ `/edit`, `/remove`, `/confirm`, `/cancel`), `/chat/{chat_id}/events/{id}/complete`, `/chat/{chat_id}/stats`, `/notifications/claim`, `/notifications/{id}/ack`, `/notifications/{id}/snooze`, `/notifications/{id}/checkin` |
 | Files | `POST/GET /api/events/{id}/files`, `DELETE /api/files/{id}`, `POST /api/files/{id}/text` |
-| Assistant | `POST /api/assistant/message`, `POST /api/assistant/confirm`, `POST /api/assistant/search`, `POST /api/assistant/transcribe`, `POST /api/assistant/file` |
+| Assistant | `POST /api/assistant/chat` (proposal → `PUT /api/assistant/drafts/{id}`, `POST .../confirm`, `DELETE`), `POST /api/assistant/search`, `POST /api/assistant/transcribe`, `POST /api/assistant/file`; legacy `POST /api/assistant/message`, `POST /api/assistant/confirm` |
 | Export | `GET /api/calendar/export.ics` |
 
 ### Reminder flow
 
 1. On the site the user clicks "Подключить Telegram" and gets a deep link `t.me/<bot>?start=<code>` (single-use, valid for 15 minutes).
 2. The bot receives `/start <code>` and calls `/internal/bot/link`, which stores the chat id on the user.
-3. Every `NOTIFICATION_POLL_SECONDS` the bot calls `/notifications/claim`. That call queues due reminders and digests (deduplicated by a key), skips quiet hours, expires stale items, and hands the batch to the bot (`FOR UPDATE SKIP LOCKED`, so several bot instances are safe).
+3. Every `NOTIFICATION_POLL_SECONDS` the bot calls `/notifications/claim`. That call extends recurring series, queues due reminders, digests and the midday check-in (deduplicated by a key), skips quiet hours, expires stale items, and hands the batch to the bot (`FOR UPDATE SKIP LOCKED`, so several bot instances are safe).
 4. The bot sends each message and acks it. Transient errors are retried up to 3 times. If the user blocked the bot, Telegram is unlinked.
+
+## Tests
+
+See `tests/README.md`: `tests/test_dates.py` runs without a database, the rest need PostgreSQL migrated to head.
 
 ## Migrations
 

@@ -59,7 +59,7 @@ class _PublicOnlyBackend(httpcore.AsyncNetworkBackend):
 
 
 def guarded_client(*, verify: bool = True, **kwargs) -> httpx.AsyncClient:
-    """HTTP client for user-supplied URLs (Jira, CalDAV, Obsidian): http(s) only and, in
+    """HTTP client for user-supplied URLs (Jira, CalDAV): http(s) only and, in
     production, public addresses only. Environment proxies are ignored so they can't bypass it."""
     transport = httpx.AsyncHTTPTransport(verify=verify)
     if not settings.allow_private_integration_urls:

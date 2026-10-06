@@ -9,12 +9,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.models.models import Event, Notification, NotificationStatus, ReminderSettings, User
+from app.services import insights, tasks
 from app.services.events import default_calendar
 from app.services.integrations.service import user_timezone
 from app.services.ru import MONTHS, WEEKDAYS_ACCUSATIVE, plural, relative_day, time_range
 
 MAX_LEAD_MINUTES = 7 * 24 * 60
 DIGEST_WINDOW = timedelta(hours=6)
+CHECKIN_WINDOW = timedelta(hours=3)
 CLAIM_TIMEOUT = timedelta(minutes=5)
 MAX_ATTEMPTS = 3
 LINK_CODE_LIFETIME = timedelta(minutes=15)
@@ -81,7 +83,7 @@ def digest_text(events: list[Event], day: datetime, tz: ZoneInfo) -> str:
     count = len(events)
     lines = ["☀️ <b>Доброе утро!</b>", f"План на {date_text} — {count} {plural(count, 'событие', 'события', 'событий')}", ""]
     for event in events:
-        when = "весь день" if event.all_day else f"{event.start_at.astimezone(tz):%H:%M}"
+        when = "без времени" if event.all_day else f"{event.start_at.astimezone(tz):%H:%M}"
         line = f"<b>{when}</b>  {html.escape(event.title)}"
         if event.location:
             line += f"  · 📍 {html.escape(event.location)}"
@@ -100,7 +102,7 @@ async def generate_due(session: AsyncSession, now: datetime) -> int:
     for user, reminder_settings in rows.all():
         tz = ZoneInfo(user_timezone(user))
         leads = sorted({minutes for minutes in reminder_settings.lead_times or [] if 0 <= minutes <= MAX_LEAD_MINUTES})
-        conditions = [Event.user_id == user.id, Event.start_at > now, Event.all_day.is_(False)]
+        conditions = [Event.user_id == user.id, Event.start_at > now, Event.all_day.is_(False), Event.completed_at.is_(None)]
         conditions.append(
             or_(
                 Event.start_at <= now + timedelta(minutes=max(leads, default=0)),
@@ -148,14 +150,38 @@ async def generate_due(session: AsyncSession, now: datetime) -> int:
                         "expires_at": day_end,
                     }
                 )
+
+        if reminder_settings.checkin_enabled:
+            local_now = now.astimezone(tz)
+            checkin_at = datetime.combine(local_now.date(), reminder_settings.checkin_time, tz)
+            dedupe_key = f"checkin:{user.id}:{local_now.date().isoformat()}"
+            if checkin_at <= local_now < checkin_at + CHECKIN_WINDOW and not await session.scalar(select(Notification.id).where(Notification.dedupe_key == dedupe_key)):
+                found = await insights.checkin(session, user, local_now)
+                if found:
+                    text_body, payload = found
+                    values.append(
+                        {
+                            "user_id": user.id,
+                            "event_id": None,
+                            "kind": "checkin",
+                            "dedupe_key": dedupe_key,
+                            "text": text_body,
+                            "payload": payload,
+                            "scheduled_for": now,
+                            "expires_at": datetime.combine(local_now.date() + timedelta(days=1), time.min, tz),
+                        }
+                    )
     if not values:
         return 0
+    for value in values:
+        value.setdefault("payload", None)
     result = await session.execute(insert(Notification).values(values).on_conflict_do_nothing(index_elements=["dedupe_key"]))
     return result.rowcount or 0
 
 
 async def claim(session: AsyncSession, limit: int = 50) -> list[dict]:
     now = datetime.now(timezone.utc)
+    await tasks.extend_series(session, now)
     await generate_due(session, now)
     await session.execute(
         update(Notification)
@@ -195,6 +221,7 @@ async def claim(session: AsyncSession, limit: int = 50) -> list[dict]:
                 "text": notification.text,
                 "kind": notification.kind,
                 "event_id": notification.event_id,
+                "payload": notification.payload,
                 "url": f"{settings.public_app_url}/app/events/{notification.event_id}" if settings.public_app_url and notification.event_id else None,
             }
         )
