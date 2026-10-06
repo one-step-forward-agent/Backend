@@ -1,0 +1,47 @@
+venv/
+.venv/
+env/
+
+.env
+.env.*
+!.env.example
+
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+*.log
+*.tmp
+*.temp
+tmp/
+temp/
+
+# Temporary files created during audio and document processing
+*.ogg
+*.wav
+*.mp3
+*.mp4
+
+# Local databases and generated calendar exports
+*.db
+*.sqlite
+*.sqlite3
+calendar.ics
+
+# IDE and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local project files
+todo.txt
+
+storage/

@@ -1,0 +1,183 @@
+from datetime import date, datetime, time, timedelta, timezone
+from urllib.parse import urljoin
+from uuid import uuid4
+from xml.etree import ElementTree
+from zoneinfo import ZoneInfo
+
+import httpx
+from icalendar import Calendar as ICalendar
+from icalendar import Event as IEvent
+
+from app.services.integrations.base import ConfigField, EventPayload, IntegrationError, IntegrationProvider, PushResult, RemoteItem, guarded_client
+
+NS = {"d": "DAV:", "c": "urn:ietf:params:xml:ns:caldav"}
+
+PRINCIPAL_QUERY = """<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:"><d:prop><d:current-user-principal/></d:prop></d:propfind>"""
+
+HOME_QUERY = """<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:prop><c:calendar-home-set/></d:prop></d:propfind>"""
+
+CALENDARS_QUERY = """<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:prop><d:resourcetype/><d:displayname/><c:supported-calendar-component-set/></d:prop>
+</d:propfind>"""
+
+EVENTS_QUERY = """<?xml version="1.0" encoding="utf-8"?>
+<c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:prop><d:getetag/><c:calendar-data><c:expand start="{start}" end="{end}"/></c:calendar-data></d:prop>
+  <c:filter><c:comp-filter name="VCALENDAR"><c:comp-filter name="VEVENT">
+    <c:time-range start="{start}" end="{end}"/>
+  </c:comp-filter></c:comp-filter></c:filter>
+</c:calendar-query>"""
+
+
+def _caldav_time(value: datetime) -> str:
+    return value.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+class AppleCalendarIntegration(IntegrationProvider):
+    slug = "apple"
+    title = "Apple Calendar"
+    description = "iCloud CalDAV. Нужен Apple ID и пароль приложения (appleid.apple.com → Пароли приложений)."
+    fields = [
+        ConfigField("username", "Apple ID", placeholder="name@icloud.com"),
+        ConfigField("app_password", "Пароль приложения", type="password", secret=True, placeholder="xxxx-xxxx-xxxx-xxxx"),
+        ConfigField("calendar_name", "Календарь для экспорта", required=False, placeholder="Пусто — первый доступный"),
+        ConfigField("server_url", "CalDAV сервер", type="url", required=False, default="https://caldav.icloud.com/", help="Можно указать любой CalDAV-сервер"),
+    ]
+
+    def _client(self) -> httpx.AsyncClient:
+        return guarded_client(
+            auth=(self.config["username"], self.secrets["app_password"]),
+            timeout=20,
+            follow_redirects=True,
+            headers={"Content-Type": "application/xml; charset=utf-8"},
+        )
+
+    async def _multistatus(self, client: httpx.AsyncClient, method: str, url: str, body: str, depth: str) -> tuple[str, ElementTree.Element]:
+        try:
+            response = await client.request(method, url, content=body, headers={"Depth": depth})
+        except (httpx.HTTPError, httpx.InvalidURL) as error:
+            raise IntegrationError("CalDAV сервер недоступен") from error
+        if response.status_code == 401:
+            raise IntegrationError("Неверный Apple ID или пароль приложения")
+        if response.status_code != 207:
+            raise IntegrationError(f"CalDAV сервер ответил {response.status_code}")
+        return str(response.url), ElementTree.fromstring(response.content)
+
+    async def _calendars(self, client: httpx.AsyncClient) -> list[tuple[str, str]]:
+        base = self.config.get("server_url") or "https://caldav.icloud.com/"
+        url, tree = await self._multistatus(client, "PROPFIND", base, PRINCIPAL_QUERY, "0")
+        principal = tree.find(".//d:current-user-principal/d:href", NS)
+        if principal is None or not principal.text:
+            raise IntegrationError("CalDAV сервер не вернул principal")
+        url, tree = await self._multistatus(client, "PROPFIND", urljoin(url, principal.text), HOME_QUERY, "0")
+        home = tree.find(".//c:calendar-home-set/d:href", NS)
+        if home is None or not home.text:
+            raise IntegrationError("CalDAV сервер не вернул calendar-home-set")
+        url, tree = await self._multistatus(client, "PROPFIND", urljoin(url, home.text), CALENDARS_QUERY, "1")
+        calendars = []
+        for response in tree.findall("d:response", NS):
+            if response.find(".//d:resourcetype/c:calendar", NS) is None:
+                continue
+            components = {item.get("name") for item in response.findall(".//c:supported-calendar-component-set/c:comp", NS)}
+            if components and "VEVENT" not in components:
+                continue
+            href = response.findtext("d:href", namespaces=NS)
+            name = response.findtext(".//d:displayname", namespaces=NS) or href
+            calendars.append((urljoin(url, href), name))
+        return calendars
+
+    async def verify(self) -> str:
+        async with self._client() as client:
+            calendars = await self._calendars(client)
+        if not calendars:
+            raise IntegrationError("В аккаунте нет календарей с событиями")
+        return f"{self.config['username']} · календарей: {len(calendars)}"
+
+    async def fetch_items(self, start: datetime, end: datetime) -> list[RemoteItem]:
+        tz = ZoneInfo(self.context.timezone)
+        body = EVENTS_QUERY.format(start=_caldav_time(start), end=_caldav_time(end))
+        items = []
+        async with self._client() as client:
+            for calendar_url, calendar_name in await self._calendars(client):
+                _, tree = await self._multistatus(client, "REPORT", calendar_url, body, "1")
+                for data in tree.iterfind(".//c:calendar-data", NS):
+                    if not data.text:
+                        continue
+                    for component in ICalendar.from_ical(data.text).walk("VEVENT"):
+                        item = self._to_item(component, tz, calendar_name)
+                        if item:
+                            items.append(item)
+        return items
+
+    @staticmethod
+    def _to_item(component, tz: ZoneInfo, calendar_name: str) -> RemoteItem | None:
+        start = component.decoded("DTSTART", None)
+        if start is None:
+            return None
+        end = component.decoded("DTEND", None)
+        all_day = not isinstance(start, datetime)
+        if all_day:
+            start_at = datetime.combine(start, time.min, tz)
+            end_at = datetime.combine(end, time.min, tz) if isinstance(end, date) else start_at + timedelta(days=1)
+        else:
+            start_at = start if start.tzinfo else start.replace(tzinfo=tz)
+            end_at = end if isinstance(end, datetime) else start_at + timedelta(hours=1)
+            end_at = end_at if end_at.tzinfo else end_at.replace(tzinfo=tz)
+        uid = str(component.get("UID", uuid4().hex))
+        recurrence = component.get("RECURRENCE-ID")
+        if recurrence is not None:
+            uid = f"{uid}@{recurrence.to_ical().decode()}"
+        description = str(component.get("DESCRIPTION")) if component.get("DESCRIPTION") else None
+        return RemoteItem(
+            external_id=uid[:200],
+            title=str(component.get("SUMMARY", "(без названия)")),
+            start_at=start_at,
+            end_at=end_at,
+            all_day=all_day,
+            description=description,
+            location=str(component.get("LOCATION")) if component.get("LOCATION") else None,
+            url=None,
+        )
+
+    async def push_event(self, event: EventPayload) -> PushResult:
+        uid = f"{uuid4()}@focus-day"
+        component = IEvent()
+        component.add("uid", uid)
+        component.add("summary", event.title)
+        component.add("dtstamp", datetime.now(timezone.utc))
+        if event.all_day:
+            component.add("dtstart", event.start_at.date())
+            component.add("dtend", max(event.end_at.date(), event.start_at.date() + timedelta(days=1)))
+        else:
+            component.add("dtstart", event.start_at.astimezone(timezone.utc))
+            component.add("dtend", event.end_at.astimezone(timezone.utc))
+        if event.description:
+            component.add("description", event.description)
+        if event.location:
+            component.add("location", event.location)
+        calendar = ICalendar()
+        calendar.add("prodid", "-//Focus Day//RU")
+        calendar.add("version", "2.0")
+        calendar.add_component(component)
+        async with self._client() as client:
+            calendars = await self._calendars(client)
+            wanted = (self.config.get("calendar_name") or "").strip().lower()
+            target = next((url for url, name in calendars if name.lower() == wanted), None) if wanted else None
+            target = target or (calendars[0][0] if calendars else None)
+            if not target:
+                raise IntegrationError("Не найден календарь для экспорта")
+            url = urljoin(target if target.endswith("/") else f"{target}/", f"{uuid4().hex}.ics")
+            try:
+                response = await client.put(
+                    url,
+                    content=calendar.to_ical(),
+                    headers={"Content-Type": "text/calendar; charset=utf-8", "If-None-Match": "*"},
+                )
+            except (httpx.HTTPError, httpx.InvalidURL) as error:
+                raise IntegrationError("CalDAV сервер недоступен") from error
+        if response.status_code not in (200, 201, 204):
+            raise IntegrationError(f"CalDAV сервер отклонил событие ({response.status_code})")
+        return PushResult(external_id=uid)

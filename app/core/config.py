@@ -1,0 +1,90 @@
+import logging
+import os
+from dataclasses import dataclass
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+
+load_dotenv()
+logger = logging.getLogger(__name__)
+
+BUNDLED_CA = Path(__file__).resolve().parents[2] / "certs" / "russian_trusted_root_ca.pem"
+PLACEHOLDER_SECRETS = {"", "change-me", "replace-with-a-random-secret", "local-bot-token", "same-value-as-backend"}
+
+
+def _bool(name: str, default: bool = False) -> bool:
+    return os.getenv(name, str(default)).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _is_production() -> bool:
+    return os.getenv("APP_ENV", "development").strip().lower() == "production"
+
+
+def _list(name: str) -> tuple[str, ...]:
+    return tuple(item.strip().rstrip("/") for item in os.getenv(name, "").split(",") if item.strip())
+
+
+def _database_url() -> str:
+    url = os.getenv("DATABASE_URL", "postgresql+asyncpg://postgres:admin@127.0.0.1:5432/focus_day").strip()
+    for prefix in ("postgres://", "postgresql://"):
+        if url.startswith(prefix):
+            return "postgresql+asyncpg://" + url[len(prefix):]
+    return url
+
+
+@dataclass(frozen=True)
+class Settings:
+    app_env: str = os.getenv("APP_ENV", "development").strip().lower()
+    database_url: str = _database_url()
+    secret_key: str = os.getenv("SECRET_KEY", "change-me")
+    storage_path: Path = Path(os.getenv("STORAGE_PATH", "./storage"))
+    max_file_size_mb: int = int(os.getenv("MAX_FILE_SIZE_MB", "20"))
+    google_client_id: str | None = os.getenv("GOOGLE_CLIENT_ID")
+    google_client_secret: str | None = os.getenv("GOOGLE_CLIENT_SECRET")
+    google_redirect_uri: str = os.getenv(
+        "GOOGLE_REDIRECT_URI", "http://localhost:8000/auth/google/callback"
+    )
+    gigachat_credentials: str = os.getenv("SBER_AUTHORIZATION_KEY", "")
+    gigachat_scope: str = os.getenv("SBER_SCOPE", "GIGACHAT_API_PERS")
+    gigachat_model: str = os.getenv("GIGACHAT_MODEL", "GigaChat")
+    jwt_algorithm: str = os.getenv("JWT_ALGORITHM", "HS256")
+    jwt_expire_minutes: int = int(os.getenv("JWT_EXPIRE_MINUTES", "15"))
+    jwt_refresh_expire_days: int = int(os.getenv("JWT_REFRESH_EXPIRE_DAYS", "30"))
+    cookie_secure: bool = _bool("COOKIE_SECURE")
+    integrations_encryption_key: str | None = os.getenv("INTEGRATIONS_ENCRYPTION_KEY")
+    bot_api_token: str | None = os.getenv("BOT_API_TOKEN")
+    telegram_bot_username: str | None = os.getenv("TELEGRAM_BOT_USERNAME")
+    telegram_bot_token: str | None = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TOKEN")
+    default_timezone: str = os.getenv("DEFAULT_TIMEZONE", "Europe/Moscow")
+    enable_docs: bool = _bool("ENABLE_DOCS", not _is_production())
+    allow_private_integration_urls: bool = _bool("ALLOW_PRIVATE_INTEGRATION_URLS", not _is_production())
+    # GigaChat uses the Russian Trusted Root CA (Минцифры); the certificate ships in backend/certs
+    gigachat_ca_bundle: str = os.getenv("GIGACHAT_CA_BUNDLE") or (str(BUNDLED_CA) if BUNDLED_CA.is_file() else "")
+    cors_origins: tuple[str, ...] = _list("CORS_ORIGINS")
+    public_app_url: str = os.getenv("PUBLIC_APP_URL", "").strip().rstrip("/")
+
+    def validate(self) -> None:
+        problems = []
+        if self.secret_key in PLACEHOLDER_SECRETS or len(self.secret_key) < 32:
+            problems.append("SECRET_KEY must be a random value of at least 32 characters")
+        if self.bot_api_token and (self.bot_api_token in PLACEHOLDER_SECRETS or len(self.bot_api_token) < 24):
+            problems.append("BOT_API_TOKEN must be a random value of at least 24 characters (or empty to disable the bot API)")
+        if not self.cookie_secure:
+            problems.append("COOKIE_SECURE must be true behind HTTPS")
+        if "*" in self.cors_origins:
+            raise RuntimeError("CORS_ORIGINS must list explicit origins; '*' is not allowed")
+        insecure = [origin for origin in self.cors_origins if not origin.startswith("https://")]
+        if insecure:
+            problems.append(f"CORS_ORIGINS must use https:// ({', '.join(insecure)})")
+        if not problems:
+            if not self.integrations_encryption_key:
+                logger.warning("INTEGRATIONS_ENCRYPTION_KEY is not set; integration secrets are encrypted with a key derived from SECRET_KEY")
+            return
+        if self.app_env == "production":
+            raise RuntimeError("Insecure production configuration: " + "; ".join(problems))
+        for problem in problems:
+            logger.warning("Insecure configuration (allowed because APP_ENV=%s): %s", self.app_env, problem)
+
+
+settings = Settings()
