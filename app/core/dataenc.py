@@ -35,6 +35,28 @@ from app.core.config import settings
 logger = logging.getLogger(__name__)
 
 PREFIX = "enc:v1:"
+# Every encrypted column as (table, column, kind); the context of a value is "table.column".
+# python -m app.core.reencrypt rewrites exactly these.
+ENCRYPTED_COLUMNS = (
+    ("users", "email", "text"),
+    ("users", "name", "text"),
+    ("users", "telegram_username", "text"),
+    ("users", "profile", "json"),
+    ("calendars", "name", "text"),
+    ("calendars", "description", "text"),
+    ("events", "title", "text"),
+    ("events", "description", "text"),
+    ("events", "location", "text"),
+    ("event_metadata", "notes", "text"),
+    ("event_metadata", "tags", "text"),
+    ("event_files", "original_filename", "text"),
+    ("integrations", "account_email", "text"),
+    ("notifications", "text", "text"),
+    ("conversation_messages", "content", "text"),
+    ("conversation_messages", "reply", "json"),
+    ("assistant_drafts", "items", "json"),
+    ("recommendation_cache", "items", "json"),
+)
 UNREADABLE = "[не удалось расшифровать]"
 
 

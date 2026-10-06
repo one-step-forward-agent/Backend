@@ -265,3 +265,90 @@ async def test_batch_and_profile_limits(client, user):
     assert len(created["event_ids"]) <= 500
     huge = {"spheres": [{"name": "x" * 5000}] * 10}
     assert (await client.put("/api/me/onboarding", json=huge, headers=headers)).status_code == 422
+
+
+async def test_overdue_is_only_unfinished_untimed_one_off_tasks(client, user):
+    from datetime import timezone as utc
+
+    from app.core.database import session_factory
+    from app.models.models import Event, User
+    from app.services import insights, tasks
+    from sqlalchemy import select
+
+    headers, chat_id = user
+    yesterday = today() - timedelta(days=1)
+    async with session_factory() as session:
+        user_row = await session.scalar(select(User).where(User.telegram_chat_id == chat_id))
+        await tasks.create_tasks(
+            session,
+            user_row,
+            [
+                {"title": "Встреча вчера", "date": yesterday.isoformat(), "time": "10:00"},
+                {"title": "Купить молоко", "date": yesterday.isoformat(), "time": None},
+                {"title": "Зарядка", "date": yesterday.isoformat(), "time": None, "rrule": "FREQ=DAILY"},
+            ],
+        )
+        data = await insights.facts(session, user_row, datetime.now(TZ))
+    assert data["overdue"] == ["Купить молоко"]
+    stats = (await client.get("/api/stats", headers=headers)).json()
+    day = next(entry for entry in stats["days"] if entry["date"] == yesterday.isoformat())
+    assert (day["total"], day["done"]) == (3, 1)  # the meeting happened; the to-dos were not ticked
+    items = (await client.get("/api/recommendations", headers=headers)).json()["items"]
+    assert any("Купить молоко" in item["text"] for item in items)
+
+
+async def test_recommendations_are_cached_until_the_plan_changes(client, user, monkeypatch):
+    from app.core.config import settings
+    from app.services import insights
+    from services import gigachat
+    import dataclasses
+
+    calls = []
+
+    async def fake(self, facts):
+        calls.append(facts)
+        return [{"kind": "info", "title": f"Совет {len(calls)}", "text": "Текст"}]
+
+    monkeypatch.setattr(insights, "settings", dataclasses.replace(settings, gigachat_credentials="fake"))
+    monkeypatch.setattr(gigachat.GigaChatClient, "recommendations", fake)
+    headers, chat_id = user
+    first = (await client.get("/api/recommendations", headers=headers)).json()["items"]
+    again = (await client.get("/api/recommendations", headers=headers)).json()["items"]
+    assert first == again and len(calls) == 1
+    reply = await bot_chat(client, chat_id, "отправить посылку сегодня")
+    await client.post(f"/internal/bot/chat/{chat_id}/drafts/{reply['draft_id']}/confirm", headers=BOT_HEADERS)
+    changed = (await client.get("/api/recommendations", headers=headers)).json()["items"]
+    assert len(calls) == 2 and changed[0]["title"] == "Совет 2"
+
+
+async def test_chat_history_survives_reload(client, user):
+    headers, _ = user
+    proposal = (await client.post("/api/assistant/chat", json={"text": "купить цветы завтра"}, headers=headers)).json()
+    saved = (await client.get("/api/assistant/history", headers=headers)).json()
+    assert [message["role"] for message in saved[-2:]] == ["user", "assistant"]
+    assert saved[-2]["text"] == "купить цветы завтра"
+    assert saved[-1]["reply"]["kind"] == "proposal" and saved[-1]["reply"]["draft_id"] == proposal["draft_id"]
+
+    await client.post(f"/api/assistant/drafts/{proposal['draft_id']}/confirm", headers=headers)
+    saved = (await client.get("/api/assistant/history", headers=headers)).json()
+    assert saved[-1]["reply"]["kind"] == "created"  # the proposal turned into the result, no duplicate
+    assert saved[-1]["reply"]["events"][0]["title"] == "Купить цветы"
+
+
+async def test_free_form_answers_get_the_real_calendar(client, user, fake_gigachat, monkeypatch):
+    from services import gigachat
+
+    seen = {}
+
+    async def chat_reply(self, text, timezone="Europe/Moscow", context="", name=None, calendar=""):
+        seen["calendar"] = calendar
+        return "Ответ"
+
+    monkeypatch.setattr(gigachat.GigaChatClient, "chat_reply", chat_reply)
+    headers, chat_id = user
+    reply = await bot_chat(client, chat_id, "сходить к стоматологу завтра в 9:00")
+    await client.post(f"/internal/bot/chat/{chat_id}/drafts/{reply['draft_id']}/confirm", headers=BOT_HEADERS)
+    fake_gigachat([])
+    await client.post("/api/assistant/chat", json={"text": "посоветуй, как лучше распределить нагрузку"}, headers=headers)
+    assert "Сходить к стоматологу" in seen["calendar"] and "09:00" in seen["calendar"]
+    assert (await client.post("/api/assistant/chat", json={"text": "расскажи про мои планы на завтра"}, headers=headers)).json()["kind"] == "agenda"

@@ -228,6 +228,10 @@ class ConversationMessage(Base):
     user_id: Mapped[int] = mapped_column(BigInteger, index=True)
     role: Mapped[str] = mapped_column(Text)
     content: Mapped[str] = mapped_column(EncryptedText("conversation_messages.content"))
+    # The full assistant reply, so the chat history shows proposals and results after a reload
+    reply: Mapped[dict | None] = mapped_column(EncryptedJSON("conversation_messages.reply"))
+    # The draft this reply proposed; confirming or editing the draft updates the message
+    draft_id: Mapped[int | None] = mapped_column(Integer, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
 
 
@@ -243,3 +247,15 @@ class AssistantDraft(Base):
     awaiting: Mapped[dict | None] = mapped_column(JSONB)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class RecommendationCache(Base):
+    """The last recommendations per user, reused until the plan changes (see insights.cache_key)."""
+
+    __tablename__ = "recommendation_cache"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), unique=True)
+    key: Mapped[str] = mapped_column(String(64))
+    items: Mapped[list[dict]] = mapped_column(EncryptedJSON("recommendation_cache.items"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))

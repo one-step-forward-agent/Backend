@@ -230,6 +230,12 @@ async def assistant_chat(payload: ChatRequest, user: User = Depends(get_current_
         raise HTTPException(status_code=503, detail="Временная ошибка — попробуйте ещё раз через минуту") from None
 
 
+@router.get("/assistant/history")
+async def assistant_history(limit: int = 60, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    """The saved conversation (site and Telegram), oldest first."""
+    return await chat.history(session, user, min(max(limit, 1), 200))
+
+
 @router.put("/assistant/drafts/{draft_id}")
 async def update_draft(draft_id: int, payload: DraftUpdate, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
     try:

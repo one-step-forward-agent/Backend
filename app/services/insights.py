@@ -3,18 +3,19 @@
 Both use the onboarding profile (work days and hours, goals, spheres, tone of voice).
 """
 
+import hashlib
 import html
 import json
 import logging
-import time as clock
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import ratelimit
 from app.core.config import settings
-from app.models.models import Event, User
+from app.models.models import Event, RecommendationCache, User
 from app.services import tasks
 from app.services.ru import MONTHS, WEEKDAYS_SHORT, plural
 
@@ -23,11 +24,11 @@ logger = logging.getLogger(__name__)
 DAY_NAMES = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
 DEFAULT_DAY_END = time(21, 0)
 BUSY_TASK_COUNT = 6
+OVERDUE_DAYS = 7
 MAX_SUGGESTIONS = 3
 PRIORITY_RANK = {"low": 0, "medium": 1, "high": 2, "urgent": 3}
-RECOMMENDATION_TTL = 30 * 60
 RECOMMENDATION_CALLS = 20
-_recommendation_cache: dict[int, tuple[float, str, list[dict]]] = {}
+RECOMMENDATION_SLOT_HOURS = 3
 
 GREETINGS = {
     "supportive": "Как вы? Середина дня — хороший момент свериться с планом 🌿",
@@ -117,7 +118,7 @@ async def checkin(session: AsyncSession, user: User, now: datetime) -> tuple[str
     overloaded = load > available or len(remaining) >= BUSY_TASK_COUNT
     suggestions = suggest_moves(remaining, max(load - available, 1))
     target = await target_day(session, user, ZoneInfo(str(tz)), today)
-    done = sum(event.completed_at is not None for event in events)
+    done = sum(tasks.is_done(event, now) for event in events)
 
     tone = profile.get("toneOfVoice") if isinstance(profile, dict) else None
     lines = [f"🕐 <b>{GREETINGS.get(tone, 'Как успеваете?')}</b>", ""]
@@ -163,7 +164,7 @@ async def facts(session: AsyncSession, user: User, now: datetime) -> dict:
     tz = now.tzinfo
     today = now.date()
     events = await tasks.events_between(session, user, datetime.combine(today, time.min, tz), datetime.combine(today + timedelta(days=1), time.min, tz))
-    yesterday = await tasks.events_between(session, user, datetime.combine(today - timedelta(days=3), time.min, tz), datetime.combine(today, time.min, tz))
+    past = await tasks.events_between(session, user, datetime.combine(today - timedelta(days=OVERDUE_DAYS), time.min, tz), datetime.combine(today, time.min, tz))
     stats = await tasks.daily_stats(session, user, 7)
     profile = user.profile or {}
     end = datetime.combine(today, day_end(profile, today), tz)
@@ -173,12 +174,12 @@ async def facts(session: AsyncSession, user: User, now: datetime) -> dict:
         "now": now.strftime("%H:%M"),
         "day_end": end.strftime("%H:%M"),
         "today_total": len(events),
-        "today_done": sum(event.completed_at is not None for event in events),
+        "today_done": sum(tasks.is_done(event, now) for event in events),
         "remaining_titles": [event.title for event in remaining[:10]],
         "untimed": [event.title for event in remaining if event.all_day][:5],
         "load_minutes": load_minutes(remaining, now),
         "free_windows": [f"{start:%H:%M}–{finish:%H:%M}" for start, finish in windows[:3]],
-        "overdue": [event.title for event in yesterday if event.completed_at is None][:5],
+        "overdue": [event.title for event in past if tasks.is_overdue(event, today, tz)][:5],
         "week_percent": stats["percent"],
         "week_total": stats["total"],
         "streak": stats["streak"],
@@ -191,7 +192,7 @@ async def facts(session: AsyncSession, user: User, now: datetime) -> dict:
 def rule_recommendations(data: dict) -> list[dict]:
     found = []
     if data["overdue"]:
-        found.append({"kind": "warning", "title": "Хвосты с прошлых дней", "text": f"Не отмечены: {', '.join(data['overdue'][:3])}. Перенесите их на сегодня или завтра."})
+        found.append({"kind": "warning", "title": "Незакрытые задачи", "text": f"Остались с прошлых дней: {', '.join(data['overdue'][:3])}. Перенесите на сегодня или отметьте выполненными."})
     if data["untimed"] and data["free_windows"]:
         found.append({"kind": "info", "title": "Есть свободное окно", "text": f"{data['free_windows'][0]} — подходящее время для «{data['untimed'][0]}»."})
     available = max(0, (int(data["day_end"][:2]) * 60 + int(data["day_end"][3:])) - (int(data["now"][:2]) * 60 + int(data["now"][3:])))
@@ -209,14 +210,34 @@ def rule_recommendations(data: dict) -> list[dict]:
     return found[:2]
 
 
+def cache_key(user: User, now: datetime, events: list[Event], data: dict) -> str:
+    """Changes only when the plan does: today's tasks and their marks, overdue tasks, the week's result,
+    the profile — plus a 3-hour slot of the day, so advice about free time does not go stale."""
+    state = {
+        "day": now.date().isoformat(),
+        "slot": now.hour // RECOMMENDATION_SLOT_HOURS,
+        "today": sorted((event.id, event.completed_at is not None, event.start_at.isoformat()) for event in events),
+        "overdue": data["overdue"],
+        "week": data["week_percent"] // 10,
+        "profile": [data["goals"], data["tone"]],
+    }
+    return hashlib.sha256(json.dumps(state, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest()
+
+
 async def recommendations(session: AsyncSession, user: User) -> list[dict]:
-    """Up to two short recommendations; written by GigaChat from the facts, with rule-based fallback."""
+    """Up to two short recommendations, written by GigaChat from the facts (rules as fallback).
+
+    The result is stored per user and reused until the plan changes, so reloading the page
+    does not call GigaChat again."""
     now = datetime.now(tasks.local_tz(user))
     data = await facts(session, user, now)
-    key = json.dumps({k: v for k, v in data.items() if k != "now"}, ensure_ascii=False, sort_keys=True)
-    cached = _recommendation_cache.get(user.id)
-    if cached and cached[1] == key and clock.monotonic() - cached[0] < RECOMMENDATION_TTL:
-        return cached[2]
+    today_events = await tasks.events_between(
+        session, user, datetime.combine(now.date(), time.min, now.tzinfo), datetime.combine(now.date() + timedelta(days=1), time.min, now.tzinfo)
+    )
+    key = cache_key(user, now, today_events, data)
+    cached = await session.scalar(select(RecommendationCache).where(RecommendationCache.user_id == user.id))
+    if cached and cached.key == key and cached.items:
+        return cached.items
     found = rule_recommendations(data)
     # GigaChat is paid: at most RECOMMENDATION_CALLS per hour per user, rules otherwise
     key_name = f"recommendations:{user.id}"
@@ -230,5 +251,9 @@ async def recommendations(session: AsyncSession, user: User) -> list[dict]:
                 found = generated
         except Exception:
             logger.exception("GigaChat recommendations failed")
-    _recommendation_cache[user.id] = (clock.monotonic(), key, found)
+    if cached:
+        cached.key, cached.items, cached.created_at = key, found, datetime.now(timezone.utc)
+    else:
+        session.add(RecommendationCache(user_id=user.id, key=key, items=found, created_at=datetime.now(timezone.utc)))
+    await session.commit()
     return found

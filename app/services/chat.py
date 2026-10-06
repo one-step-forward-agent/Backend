@@ -1,3 +1,4 @@
+import json
 import logging
 import re
 from datetime import date, datetime, time, timedelta, timezone
@@ -41,6 +42,7 @@ NO_TIME_WORDS = re.compile(r"^\s*(без\s+времени|весь\s+день|у
 QUESTION_PREFIXES = (
     "что ", "что?", "какие ", "какая ", "какой ", "покажи", "есть ли ", "когда ", "во сколько ", "где у меня",
     "план ", "планы", "план?", "расписание", "мои ", "мой ", "сколько у меня", "найди ", "найти ", "где ",
+    "напомни, что", "что запланировано", "свободен ли", "занят ли",
 )
 STOP_WORDS = {
     "что", "есть", "ли", "у", "меня", "мне", "мои", "мой", "моя", "моё", "мое", "план", "планы", "планов", "планах",
@@ -50,7 +52,8 @@ STOP_WORDS = {
     "дела", "делам", "дело", "выходные", "выходных", "выходным", "этой", "этот", "эту", "следующей", "следующую",
     "следующий", "задача", "задачу", "задачи", "задач", "задаче", "найди", "найти", "где", "во", "запланировано",
     "запланирована", "запланирован", "назначено", "назначена", "назначен", "время", "часов", "пожалуйста", "напомни",
-    "все", "всё", "всех", "list", "about",
+    "все", "всё", "всех", "list", "about", "расскажи", "расскажите", "подскажи", "скажи", "покажите", "посмотри",
+    "про", "обо", "свободен", "свободна", "занят", "занята", "планирую", "запланировал", "запланировала", "моих", "моя",
 }
 _stemmer = snowballstemmer.stemmer("russian")
 
@@ -66,8 +69,74 @@ class DraftNotFound(Exception):
 # ---------- conversation memory ----------
 
 
-async def remember(session: AsyncSession, user_id: int, role: str, content: str) -> None:
-    session.add(ConversationMessage(user_id=user_id, role=role, content=content[:4000], created_at=datetime.now(timezone.utc)))
+HISTORY_LIMIT = 60
+MAX_STORED_REPLY = 60_000
+
+
+def storable(reply: dict | None) -> dict | None:
+    """The reply as kept in the history; a huge agenda is kept as its summary."""
+    if reply is None:
+        return None
+    if len(json.dumps(reply, ensure_ascii=False, default=str)) > MAX_STORED_REPLY:
+        return {"kind": "answer", "text": summarize(reply)}
+    return reply
+
+
+async def remember(session: AsyncSession, user_id: int, role: str, content: str, reply: dict | None = None) -> None:
+    session.add(
+        ConversationMessage(
+            user_id=user_id,
+            role=role,
+            content=content[:4000],
+            reply=storable(reply),
+            draft_id=reply.get("draft_id") if reply and reply.get("kind") == "proposal" else None,
+            created_at=datetime.now(timezone.utc),
+        )
+    )
+
+
+async def update_draft_messages(session: AsyncSession, user: User, draft_id: int, reply: dict) -> None:
+    """Show the draft's latest state (edited, added or cancelled) wherever the history shows it."""
+    messages = list(await session.scalars(select(ConversationMessage).where(ConversationMessage.user_id == user.id, ConversationMessage.draft_id == draft_id)))
+    for message in messages:
+        message.reply = storable(reply)
+        message.content = summarize(reply)[:4000]
+    if not messages and reply.get("kind") == "created":
+        await remember(session, user.id, "assistant", summarize(reply), reply)
+
+
+async def history(session: AsyncSession, user: User, limit: int = HISTORY_LIMIT) -> list[dict]:
+    rows = list(
+        await session.scalars(
+            select(ConversationMessage)
+            .where(ConversationMessage.user_id == user.id)
+            .order_by(ConversationMessage.created_at.desc(), ConversationMessage.id.desc())
+            .limit(limit)
+        )
+    )
+    return [
+        {"id": row.id, "role": row.role, "text": row.content, "reply": row.reply, "created_at": row.created_at.isoformat()}
+        for row in reversed(rows)
+    ]
+
+
+async def calendar_context(session: AsyncSession, user: User, tz: ZoneInfo) -> str:
+    """The user's real plan for the assistant: today and the next 7 days, plus unfinished tasks."""
+    now = datetime.now(tz)
+    today = now.date()
+    events = await tasks.events_between(session, user, datetime.combine(today - timedelta(days=7), time.min, tz), datetime.combine(today + timedelta(days=8), time.min, tz))
+    lines = []
+    for event in events:
+        start = event.start_at.astimezone(tz)
+        overdue = tasks.is_overdue(event, today, tz)
+        if start.date() < today and not overdue:
+            continue
+        when = "без времени" if event.all_day else f"{start:%H:%M}"
+        mark = " (выполнено)" if event.completed_at else " (не выполнено, просрочено)" if overdue else ""
+        lines.append(f"{day_label(start.date(), today)}, {when}: {event.title}{mark}")
+        if len(lines) >= 60:
+            break
+    return "\n".join(lines) or "(в календаре на ближайшую неделю ничего нет)"
 
 
 async def recent_context(session: AsyncSession, user_id: int) -> str:
@@ -101,7 +170,13 @@ def group_by_day(events: list[Event], tz: ZoneInfo, today: date) -> list[dict]:
 
 def is_question(text: str) -> bool:
     lowered = " ".join(text.lower().split())
-    return lowered.startswith(QUESTION_PREFIXES) or bool(re.search(r"\bчто у меня\b|\bкогда у меня\b|\bчем я занят", lowered))
+    return lowered.startswith(QUESTION_PREFIXES) or bool(
+        re.search(
+            r"\bчто у меня\b|\bкогда у меня\b|\bчем я занят|\b(мои|какие у меня)\s+(задач|план|дел|событ|встреч)"
+            r"|\b(расскажи|подскажи|скажи|покажи)\b.*\b(план|расписан|задач|дел|событ|встреч)",
+            lowered,
+        )
+    )
 
 
 def search_keywords(text: str) -> list[str]:
@@ -479,8 +554,10 @@ async def apply_edit_text(session: AsyncSession, user: User, draft: AssistantDra
     items[index] = item
     draft.items = items
     draft.awaiting = None
+    reply = proposal(draft, tz, note="Изменено ✓")
+    await update_draft_messages(session, user, draft.id, reply)
     await session.commit()
-    return proposal(draft, tz, note="Изменено ✓")
+    return reply
 
 
 def validate_item(raw: dict, now: datetime) -> dict | None:
@@ -507,8 +584,10 @@ async def replace_items(session: AsyncSession, user: User, draft_id: int, items:
         raise ValueError("Нужна хотя бы одна задача с названием и датой")
     draft.items = cleaned
     draft.awaiting = None
+    reply = proposal(draft, tz)
+    await update_draft_messages(session, user, draft.id, reply)
     await session.commit()
-    return proposal(draft, tz)
+    return reply
 
 
 async def remove_item(session: AsyncSession, user: User, draft_id: int, index: int) -> dict:
@@ -519,10 +598,12 @@ async def remove_item(session: AsyncSession, user: User, draft_id: int, index: i
     draft.awaiting = None
     if not draft.items:
         await session.delete(draft)
-        await session.commit()
-        return {"kind": "cancelled", "text": "Черновик пуст — ничего не добавлено"}
+        reply = {"kind": "cancelled", "text": "Черновик пуст — ничего не добавлено"}
+    else:
+        reply = proposal(draft, tz, note="Удалено из черновика")
+    await update_draft_messages(session, user, draft_id, reply)
     await session.commit()
-    return proposal(draft, tz, note="Удалено из черновика")
+    return reply
 
 
 async def confirm_draft(session: AsyncSession, user: User, draft_id: int) -> dict:
@@ -544,7 +625,7 @@ async def confirm_draft(session: AsyncSession, user: User, draft_id: int) -> dic
         "event_ids": ids,
         "answer": None,
     }
-    await remember(session, user.id, "assistant", summarize(reply))
+    await update_draft_messages(session, user, draft_id, reply)
     await session.commit()
     return reply
 
@@ -552,8 +633,10 @@ async def confirm_draft(session: AsyncSession, user: User, draft_id: int) -> dic
 async def cancel_draft(session: AsyncSession, user: User, draft_id: int) -> dict:
     draft = await get_draft(session, user, draft_id)
     await session.delete(draft)
+    reply = {"kind": "cancelled", "text": "Хорошо, ничего не добавляю"}
+    await update_draft_messages(session, user, draft_id, reply)
     await session.commit()
-    return {"kind": "cancelled", "text": "Хорошо, ничего не добавляю"}
+    return reply
 
 
 # ---------- entry point ----------
@@ -615,12 +698,13 @@ async def handle_message(session: AsyncSession, user: User, text: str) -> dict:
                 from services.gigachat import GigaChatClient
 
                 try:
-                    answer = await GigaChatClient().chat_reply(text, str(tz), history, user.name)
+                    calendar = await calendar_context(session, user, tz)
+                    answer = await GigaChatClient().chat_reply(text, str(tz), history, user.name, calendar)
                 except Exception:
                     logger.exception("GigaChat chat reply failed")
             reply = {"kind": "answer", "text": answer} if answer else {"kind": "nothing"}
     await remember(session, user.id, "user", text)
-    await remember(session, user.id, "assistant", summarize(reply))
+    await remember(session, user.id, "assistant", summarize(reply), reply)
     await session.commit()
     return reply
 

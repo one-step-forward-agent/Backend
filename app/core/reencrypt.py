@@ -10,26 +10,14 @@ import json
 from sqlalchemy import text
 
 from app.core.database import engine
-from app.core.dataenc import decrypt, email_index, encrypt
+from app.core.dataenc import ENCRYPTED_COLUMNS, decrypt, email_index, encrypt
 
 BATCH = 500
 
 
-def _columns():
-    """The encrypted columns, as listed in migration 0023 (alembic/versions is not a package)."""
-    from importlib.util import module_from_spec, spec_from_file_location
-    from pathlib import Path
-
-    path = Path(__file__).resolve().parents[2] / "alembic" / "versions" / "0023_encrypt_personal_data.py"
-    spec = spec_from_file_location("encrypt_migration", path)
-    module = module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module.COLUMNS
-
-
 async def main() -> None:
     async with engine.begin() as connection:
-        for table, column, kind in _columns():
+        for table, column, kind in ENCRYPTED_COLUMNS:
             context = f"{table}.{column}"
             last_id, changed = 0, 0
             while True:

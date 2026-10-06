@@ -204,6 +204,17 @@ async def events_between(session: AsyncSession, user: User, start: datetime, end
     )
 
 
+def is_done(event: Event, now: datetime) -> bool:
+    """A task is done when marked so; a timed event (a meeting, an appointment) also once its time is over."""
+    return event.completed_at is not None or (not event.all_day and event.end_at <= now)
+
+
+def is_overdue(event: Event, today: date, tz: ZoneInfo) -> bool:
+    """Only a one-off task without a time can be overdue: past events simply happened,
+    and a missed day of a recurring task does not pile up."""
+    return event.all_day and event.completed_at is None and event.series_id is None and event.start_at.astimezone(tz).date() < today
+
+
 def _percent(done: int, total: int) -> int:
     return round(done * 100 / total) if total else 0
 
@@ -211,7 +222,8 @@ def _percent(done: int, total: int) -> int:
 async def daily_stats(session: AsyncSession, user: User, days: int = 7) -> dict:
     """Completed vs planned tasks per day for the last `days` days, ending today."""
     tz = local_tz(user)
-    today = datetime.now(tz).date()
+    now = datetime.now(tz)
+    today = now.date()
     first = today - timedelta(days=days - 1)
     start = datetime.combine(first, time.min, tz)
     events = await events_between(session, user, start, datetime.combine(today + timedelta(days=1), time.min, tz), limit=5000)
@@ -220,7 +232,7 @@ async def daily_stats(session: AsyncSession, user: User, days: int = 7) -> dict:
         day = event.start_at.astimezone(tz).date()
         if day in per_day:
             per_day[day][0] += 1
-            per_day[day][1] += event.completed_at is not None
+            per_day[day][1] += is_done(event, now)
     series = [{"date": day.isoformat(), "total": total, "done": done, "percent": _percent(done, total)} for day, (total, done) in per_day.items()]
     streak = 0
     for entry in reversed(series):

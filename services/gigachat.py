@@ -241,7 +241,9 @@ class GigaChatClient:
                 result = await response.json()
         return parse_search_filters_response(result["choices"][0]["message"]["content"])
 
-    async def chat_reply(self, text: str, timezone: str = "Europe/Moscow", context: str = "", name: str | None = None) -> str:
+    async def chat_reply(
+        self, text: str, timezone: str = "Europe/Moscow", context: str = "", name: str | None = None, calendar: str = ""
+    ) -> str:
         now = datetime.now(ZoneInfo(timezone))
         system = (
             PERSONA
@@ -255,7 +257,10 @@ class GigaChatClient:
             + (f" Пользователя зовут {name}." if name else "")
         )
         user_message = (
-            "Недавний диалог (справочно):\n"
+            "Расписание пользователя из календаря — актуальные данные. О планах, задачах и свободном времени "
+            "отвечай только по нему, а не по истории диалога:\n"
+            f"{calendar or '(нет данных)'}\n\n"
+            "Недавний диалог (справочно, может быть устаревшим):\n"
             f"{context or '(пусто)'}\n\n"
             f"Сообщение пользователя:\n{text[:6000]}"
         )
