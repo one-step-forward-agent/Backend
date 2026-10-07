@@ -9,7 +9,7 @@ from dateutil.rrule import rrulestr
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.models import Event, User
+from app.models.models import Event, Tag, User
 from app.services.dates import describe_rrule, valid_rrule
 from app.services.events import default_calendar, push_new_events_to_google
 from app.services.integrations.service import user_timezone
@@ -23,6 +23,9 @@ MAX_OCCURRENCES = 60
 MAX_EVENTS_PER_BATCH = 500
 MAX_REMINDER_MINUTES = 10080
 UNTIMED_TASK_MINUTES = 30
+STREAK_DAYS = 120
+# Timed events from these calendars are other people's meetings: they cannot be moved from here
+EXTERNAL_SOURCES = ("google", "apple", "jira", "notion")
 _last_extension: datetime | None = None
 
 
@@ -30,14 +33,43 @@ def local_tz(user: User) -> ZoneInfo:
     return ZoneInfo(user_timezone(user))
 
 
-def event_bounds(day: date, start: time | None, end: time | None, tz: ZoneInfo) -> tuple[datetime, datetime, bool]:
-    """Start, end and all_day for a task; a task without a time spans its whole day."""
+def event_bounds(
+    day: date, start: time | None, end: time | None, tz: ZoneInfo, end_day: date | None = None
+) -> tuple[datetime, datetime, bool]:
+    """Start, end and all_day for a task; a task without a time spans its whole day (or days up to end_day)."""
+    last = end_day if end_day and end_day > day else day
     if start is None:
-        midnight = datetime.combine(day, time.min, tz)
-        return midnight, midnight + timedelta(days=1), True
+        return datetime.combine(day, time.min, tz), datetime.combine(last + timedelta(days=1), time.min, tz), True
     begins = datetime.combine(day, start, tz)
-    ends = datetime.combine(day, end, tz) if end and end > start else begins + timedelta(hours=1)
-    return begins, ends, False
+    if end and datetime.combine(last, end, tz) > begins:
+        return begins, datetime.combine(last, end, tz), False
+    return begins, datetime.combine(last, start, tz) + timedelta(hours=1), False
+
+
+def deadline_moment(value, tz: ZoneInfo) -> datetime | None:
+    """A deadline from a draft: "2026-10-09T18:00" or "2026-10-09" (the end of that day)."""
+    if not isinstance(value, str) or len(value) < 10:
+        return None
+    try:
+        day = date.fromisoformat(value[:10])
+        moment = time.fromisoformat(value[11:16]) if len(value) >= 16 else time(23, 59)
+    except ValueError:
+        return None
+    return datetime.combine(day, moment, tz)
+
+
+def is_fixed(event: Event) -> bool:
+    """A task that must stay where it is: marked so, or a meeting synced from another calendar."""
+    return bool(event.is_fixed) or (not event.all_day and event.source in EXTERNAL_SOURCES)
+
+
+async def owned_tag_ids(session: AsyncSession, user: User, ids) -> list[int]:
+    """The user's own tags among ids, in the given order; unknown ids are dropped."""
+    wanted = [value for value in dict.fromkeys(ids or []) if isinstance(value, int) and not isinstance(value, bool)]
+    if not wanted:
+        return []
+    found = set(await session.scalars(select(Tag.id).where(Tag.user_id == user.id, Tag.id.in_(wanted))))
+    return [value for value in wanted if value in found][:20]
 
 
 def occurrences(rule: str, start: datetime, until: datetime, limit: int = MAX_OCCURRENCES, include_start: bool = True) -> list[datetime]:
@@ -69,6 +101,10 @@ def _copy(template: Event, moment: datetime, duration: timedelta) -> Event:
         recurrence_rule=template.recurrence_rule,
         series_id=template.series_id,
         source=template.source,
+        is_fixed=template.is_fixed,
+        tag_ids=list(template.tag_ids or []),
+        # A deadline belongs to one task; occurrences of a series do not share it
+        deadline_at=None if template.recurrence_rule else template.deadline_at,
     )
 
 
@@ -97,12 +133,13 @@ async def create_tasks(session: AsyncSession, user: User, items: list[dict], sou
             day = date.fromisoformat(item["date"])
             start_time = time.fromisoformat(item["time"]) if item.get("time") else None
             end_time = time.fromisoformat(item["end_time"]) if item.get("end_time") else None
+            end_day = date.fromisoformat(item["end_date"]) if item.get("end_date") else None
         except (KeyError, TypeError, ValueError):
             continue
         title = str(item.get("title") or "").strip()[:300]
         if not title:
             continue
-        begins, ends, all_day = event_bounds(day, start_time, end_time, tz)
+        begins, ends, all_day = event_bounds(day, start_time, end_time, tz, end_day)
         reminder = item.get("reminder_minutes")
         if not isinstance(reminder, int) or isinstance(reminder, bool) or not 0 <= reminder <= MAX_REMINDER_MINUTES:
             reminder = None
@@ -122,6 +159,9 @@ async def create_tasks(session: AsyncSession, user: User, items: list[dict], sou
             recurrence_rule=rule,
             series_id=str(uuid4()) if rule else None,
             source=source,
+            deadline_at=deadline_moment(item.get("deadline"), tz),
+            is_fixed=item.get("fixed") is True,
+            tag_ids=await owned_tag_ids(session, user, item.get("tag_ids")),
         )
         budget = MAX_EVENTS_PER_BATCH - sum(len(group) for group in groups)
         if budget <= 0:
@@ -234,17 +274,54 @@ async def daily_stats(session: AsyncSession, user: User, days: int = 7) -> dict:
             per_day[day][0] += 1
             per_day[day][1] += is_done(event, now)
     series = [{"date": day.isoformat(), "total": total, "done": done, "percent": _percent(done, total)} for day, (total, done) in per_day.items()]
-    streak = 0
-    for entry in reversed(series):
-        if entry["date"] == today.isoformat() and entry["done"] == 0:
-            continue  # today may still be in progress
-        if entry["total"] and entry["done"] == entry["total"]:
-            streak += 1
-        else:
-            break
     total = sum(entry["total"] for entry in series)
     done = sum(entry["done"] for entry in series)
-    return {"today": series[-1], "days": series, "total": total, "done": done, "percent": _percent(done, total), "streak": streak}
+    current, best = await streaks(session, user, now)
+    return {
+        "today": series[-1],
+        "days": series,
+        "total": total,
+        "done": done,
+        "percent": _percent(done, total),
+        "streak": current,
+        "best_streak": best,
+    }
+
+
+async def streaks(session: AsyncSession, user: User, now: datetime) -> tuple[int, int]:
+    """The current and the best series of completed days.
+
+    A day counts when it had tasks and all of them are done. A day without tasks neither
+    counts nor breaks the series; today counts once finished and never breaks it, since it is in progress."""
+    tz = now.tzinfo
+    today = now.date()
+    first = today - timedelta(days=STREAK_DAYS - 1)
+    events = await events_between(session, user, datetime.combine(first, time.min, tz), datetime.combine(today + timedelta(days=1), time.min, tz), limit=10000)
+    per_day: dict[date, list[int]] = {}
+    for event in events:
+        day = event.start_at.astimezone(tz).date()
+        if first <= day <= today:
+            counts = per_day.setdefault(day, [0, 0])
+            counts[0] += 1
+            counts[1] += is_done(event, now)
+    current = best = run = 0
+    current_open = True
+    for offset in range(STREAK_DAYS):
+        day = today - timedelta(days=offset)
+        total, done = per_day.get(day, (0, 0))
+        if not total:
+            continue
+        if done == total:
+            run += 1
+            if current_open:
+                current = run
+        elif day == today:
+            continue
+        else:
+            current_open = False
+            run = 0
+        best = max(best, run)
+    return current, best
 
 
 async def move_events(session: AsyncSession, user: User, event_ids: list[int], target: date) -> int:
@@ -278,4 +355,16 @@ def task_view(event: Event, tz: ZoneInfo) -> dict:
         "completed": event.completed_at is not None,
         "recurrence": describe_rrule(event.recurrence_rule),
         "series_id": event.series_id,
+        "end_date": end_day(event, tz).isoformat(),
+        "deadline": event.deadline_at.astimezone(tz).isoformat() if event.deadline_at else None,
+        "fixed": is_fixed(event),
+        "tag_ids": list(event.tag_ids or []),
     }
+
+
+def end_day(event: Event, tz: ZoneInfo) -> date:
+    """The last day the event covers (an untimed task ends at the next midnight)."""
+    end = event.end_at.astimezone(tz)
+    if event.all_day or (end.time() == time.min and end > event.start_at.astimezone(tz)):
+        return (end - timedelta(microseconds=1)).date()
+    return end.date()

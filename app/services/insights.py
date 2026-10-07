@@ -1,6 +1,8 @@
-"""Analysis of the user's day: the midday check-in and recommendations on the main screen.
+"""Analysis of the user's plan: the midday check-in, the evening summary, recommendations
+on the main screen and scheduling advice for a calendar week or month.
 
-Both use the onboarding profile (work days and hours, goals, spheres, tone of voice).
+All of them use the onboarding profile (work days and hours, goals, spheres, tone of voice)
+and plan around tasks that cannot be moved (see tasks.is_fixed).
 """
 
 import hashlib
@@ -17,7 +19,7 @@ from app.core import ratelimit
 from app.core.config import settings
 from app.models.models import Event, RecommendationCache, User
 from app.services import tasks
-from app.services.ru import MONTHS, WEEKDAYS_SHORT, plural
+from app.services.ru import MONTHS, MONTHS_NOMINATIVE, WEEKDAYS_SHORT, plural
 
 logger = logging.getLogger(__name__)
 
@@ -29,11 +31,19 @@ MAX_SUGGESTIONS = 3
 PRIORITY_RANK = {"low": 0, "medium": 1, "high": 2, "urgent": 3}
 RECOMMENDATION_CALLS = 20
 RECOMMENDATION_SLOT_HOURS = 3
+DEADLINE_SOON_DAYS = 3
+MAX_EVENING_ITEMS = 8
+MAX_MOVE_SUGGESTIONS = 20
 
 GREETINGS = {
     "supportive": "Как вы? Середина дня — хороший момент свериться с планом 🌿",
     "motivating": "Полдня позади — отличный момент ускориться 💪",
     "strict": "Контрольная точка дня.",
+}
+EVENING_GREETINGS = {
+    "supportive": "Как прошёл день? Вот итоги 🌙",
+    "motivating": "День позади — посмотрим на результат 💪",
+    "strict": "Итоги дня.",
 }
 
 
@@ -70,8 +80,8 @@ def load_minutes(events: list[Event], now: datetime) -> int:
 
 
 def suggest_moves(remaining: list[Event], overloaded_by: int) -> list[Event]:
-    """Tasks that are easiest to move: untimed first, then lower priority, then later ones; urgent stays."""
-    movable = [event for event in remaining if event.priority != "urgent" and not event.series_id]
+    """Tasks that are easiest to move: untimed first, then lower priority, then later ones; urgent and fixed ones stay."""
+    movable = [event for event in remaining if event.priority != "urgent" and not event.series_id and not tasks.is_fixed(event)]
     movable.sort(key=lambda event: (not event.all_day, PRIORITY_RANK.get(event.priority, 1), -event.start_at.timestamp()))
     chosen, freed = [], 0
     for event in movable:
@@ -171,6 +181,8 @@ async def facts(session: AsyncSession, user: User, now: datetime) -> dict:
     remaining = [event for event in events if event.completed_at is None and (event.all_day or event.end_at > now)]
     windows = free_windows(events, now, end)
     return {
+        "deadlines": await deadline_texts(session, user, now, today + timedelta(days=DEADLINE_SOON_DAYS)),
+        "fixed_today": [event.title for event in remaining if tasks.is_fixed(event)][:5],
         "now": now.strftime("%H:%M"),
         "day_end": end.strftime("%H:%M"),
         "today_total": len(events),
@@ -189,8 +201,33 @@ async def facts(session: AsyncSession, user: User, now: datetime) -> dict:
     }
 
 
+async def deadline_texts(session: AsyncSession, user: User, now: datetime, until: date) -> list[str]:
+    """Unfinished tasks whose deadline is between now and the end of `until`: "Отчёт — до пт, 9 октября 18:00"."""
+    tz = now.tzinfo
+    rows = await session.scalars(
+        select(Event)
+        .where(
+            Event.user_id == user.id,
+            Event.completed_at.is_(None),
+            Event.deadline_at.is_not(None),
+            Event.deadline_at >= now,
+            Event.deadline_at < datetime.combine(until + timedelta(days=1), time.min, tz),
+        )
+        .order_by(Event.deadline_at)
+        .limit(10)
+    )
+    return [f"{event.title} — до {deadline_label(event.deadline_at.astimezone(tz), now.date())}" for event in rows]
+
+
+def deadline_label(moment: datetime, today: date) -> str:
+    text = day_text(moment.date(), today) if moment.date() != today else "сегодня"
+    return text if moment.time() >= time(23, 59) else f"{text} {moment:%H:%M}"
+
+
 def rule_recommendations(data: dict) -> list[dict]:
     found = []
+    if data.get("deadlines"):
+        found.append({"kind": "warning", "title": "Скоро дедлайн", "text": f"{data['deadlines'][0]}. Выделите на неё время заранее."})
     if data["overdue"]:
         found.append({"kind": "warning", "title": "Незакрытые задачи", "text": f"Остались с прошлых дней: {', '.join(data['overdue'][:3])}. Перенесите на сегодня или отметьте выполненными."})
     if data["untimed"] and data["free_windows"]:
@@ -210,6 +247,11 @@ def rule_recommendations(data: dict) -> list[dict]:
     return found[:2]
 
 
+def plan_cache_key(now: datetime, data: dict) -> str:
+    state = {"day": now.date().isoformat(), "slot": now.hour // RECOMMENDATION_SLOT_HOURS, "facts": data}
+    return hashlib.sha256(json.dumps(state, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest()
+
+
 def cache_key(user: User, now: datetime, events: list[Event], data: dict) -> str:
     """Changes only when the plan does: today's tasks and their marks, overdue tasks, the week's result,
     the profile — plus a 3-hour slot of the day, so advice about free time does not go stale."""
@@ -220,25 +262,34 @@ def cache_key(user: User, now: datetime, events: list[Event], data: dict) -> str
         "overdue": data["overdue"],
         "week": data["week_percent"] // 10,
         "profile": [data["goals"], data["tone"]],
+        "deadlines": data.get("deadlines"),
     }
     return hashlib.sha256(json.dumps(state, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest()
 
 
-async def recommendations(session: AsyncSession, user: User) -> list[dict]:
-    """Up to two short recommendations, written by GigaChat from the facts (rules as fallback).
+async def recommendations(session: AsyncSession, user: User, scope: str = "today", day: date | None = None) -> list[dict]:
+    """Recommendations written by GigaChat from the facts (rules as fallback): two for today on the main
+    screen, or up to three scheduling ones for the calendar week or month around `day`.
 
-    The result is stored per user and reused until the plan changes, so reloading the page
+    The result is stored per user and screen and reused until the plan changes, so reloading the page
     does not call GigaChat again."""
     now = datetime.now(tasks.local_tz(user))
+    if scope in ("week", "month"):
+        first, last = period_bounds(scope, day or now.date())
+        data = await period_facts(session, user, now, first, last, scope)
+        return await _cached(session, user, f"{scope}:{first.isoformat()}", plan_cache_key(now, data), data, plan_rules, "plan_recommendations")
     data = await facts(session, user, now)
     today_events = await tasks.events_between(
         session, user, datetime.combine(now.date(), time.min, now.tzinfo), datetime.combine(now.date() + timedelta(days=1), time.min, now.tzinfo)
     )
-    key = cache_key(user, now, today_events, data)
-    cached = await session.scalar(select(RecommendationCache).where(RecommendationCache.user_id == user.id))
+    return await _cached(session, user, "today", cache_key(user, now, today_events, data), data, rule_recommendations, "recommendations")
+
+
+async def _cached(session: AsyncSession, user: User, scope: str, key: str, data: dict, rules, method: str) -> list[dict]:
+    cached = await session.scalar(select(RecommendationCache).where(RecommendationCache.user_id == user.id, RecommendationCache.scope == scope))
     if cached and cached.key == key and cached.items:
         return cached.items
-    found = rule_recommendations(data)
+    found = rules(data)
     # GigaChat is paid: at most RECOMMENDATION_CALLS per hour per user, rules otherwise
     key_name = f"recommendations:{user.id}"
     if settings.gigachat_credentials and not ratelimit.is_limited(key_name, RECOMMENDATION_CALLS, 3600):
@@ -246,14 +297,206 @@ async def recommendations(session: AsyncSession, user: User) -> list[dict]:
         from services.gigachat import GigaChatClient
 
         try:
-            generated = await GigaChatClient().recommendations(data)
+            generated = await getattr(GigaChatClient(), method)(data)
             if generated:
                 found = generated
         except Exception:
-            logger.exception("GigaChat recommendations failed")
+            logger.exception("GigaChat %s failed", method)
     if cached:
         cached.key, cached.items, cached.created_at = key, found, datetime.now(timezone.utc)
     else:
-        session.add(RecommendationCache(user_id=user.id, key=key, items=found, created_at=datetime.now(timezone.utc)))
+        session.add(RecommendationCache(user_id=user.id, scope=scope, key=key, items=found, created_at=datetime.now(timezone.utc)))
     await session.commit()
     return found
+
+
+# ---------- scheduling advice for a calendar week or month ----------
+
+
+def period_bounds(scope: str, day: date) -> tuple[date, date]:
+    if scope == "week":
+        first = day - timedelta(days=day.weekday())
+        return first, first + timedelta(days=6)
+    first = day.replace(day=1)
+    return first, (first + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+
+
+def period_label(scope: str, first: date, last: date) -> str:
+    if scope == "month":
+        return f"{MONTHS_NOMINATIVE[first.month - 1]} {first.year}"
+    if first.month == last.month:
+        return f"неделя {first.day}–{last.day} {MONTHS[last.month - 1]}"
+    return f"неделя {first.day} {MONTHS[first.month - 1]} – {last.day} {MONTHS[last.month - 1]}"
+
+
+async def period_facts(session: AsyncSession, user: User, now: datetime, first: date, last: date, scope: str) -> dict:
+    """What the plan of a week or month looks like from today on: load per day, fixed and flexible tasks, deadlines."""
+    tz = now.tzinfo
+    today = now.date()
+    profile = user.profile or {}
+    events = await tasks.events_between(session, user, datetime.combine(first, time.min, tz), datetime.combine(last + timedelta(days=1), time.min, tz), limit=3000)
+    ahead = [today + timedelta(days=offset) for offset in range((last - max(first, today)).days + 1)] if last >= today else []
+    load = {day: [0, 0] for day in ahead}
+    for event in events:
+        day = event.start_at.astimezone(tz).date()
+        if day in load and event.completed_at is None:
+            load[day][0] += 1
+            load[day][1] += tasks.UNTIMED_TASK_MINUTES if event.all_day else int((event.end_at - event.start_at).total_seconds() // 60)
+    workdays = work_days(profile)
+    busy = [day for day, (count, minutes) in load.items() if count >= BUSY_TASK_COUNT or minutes > 8 * 60]
+    free = [day for day, (count, _) in load.items() if count <= 1 and day.weekday() in workdays and day > today]
+    upcoming = [event for event in events if event.start_at.astimezone(tz).date() >= today and event.completed_at is None]
+    fixed = [event for event in upcoming if tasks.is_fixed(event)]
+    flexible = [event for event in upcoming if event.all_day and not tasks.is_fixed(event) and not event.series_id]
+    past = [event for event in events if event.start_at.astimezone(tz).date() < today]
+
+    def when(event: Event) -> str:
+        start = event.start_at.astimezone(tz)
+        return day_text(start.date(), today) + ("" if event.all_day else f" {start:%H:%M}")
+
+    def flexible_text(event: Event) -> str:
+        text = f"{event.title} ({when(event)})"
+        if event.deadline_at:
+            text += f", дедлайн {deadline_label(event.deadline_at.astimezone(tz), today)}"
+        return text
+
+    return {
+        "period": period_label(scope, first, last),
+        "past": last < today,
+        "days_ahead": len(ahead),
+        "busy_days": [f"{day_text(day, today)}: {load[day][0]} {plural(load[day][0], 'задача', 'задачи', 'задач')}" for day in busy][:5],
+        "free_days": [day_text(day, today) for day in free][:7],
+        "fixed": [f"{event.title} ({when(event)})" for event in fixed][:12],
+        "flexible": [flexible_text(event) for event in flexible][:12],
+        "deadlines": await deadline_texts(session, user, now, last) if last >= today else [],
+        "past_done": sum(tasks.is_done(event, now) for event in past),
+        "past_total": len(past),
+        "goals": [str(goal) for goal in profile.get("goals") or []][:5],
+        "tone": profile.get("toneOfVoice"),
+    }
+
+
+def plan_rules(data: dict) -> list[dict]:
+    found = []
+    if data["past"]:
+        total, done = data["past_total"], data["past_done"]
+        text = f"Выполнено {done} из {total} задач." if total else "Задач в этот период не было."
+        return [{"kind": "success" if total and done == total else "info", "title": "Период завершён", "text": text}]
+    if data["deadlines"]:
+        target = f" Запланируйте её на {data['free_days'][0]} — там свободно." if data["free_days"] else ""
+        found.append({"kind": "warning", "title": "Близкий дедлайн", "text": f"{data['deadlines'][0]}.{target}"})
+    if data["busy_days"]:
+        target = f" Гибкие задачи можно перенести на {data['free_days'][0]}." if data["free_days"] else " Часть гибких задач стоит перенести."
+        found.append({"kind": "warning", "title": "Перегруженный день", "text": f"{data['busy_days'][0]}.{target}"})
+    if data["flexible"] and data["free_days"]:
+        found.append({"kind": "info", "title": "Есть свободные дни", "text": f"{', '.join(data['free_days'][:2])} почти свободны — хорошее время для «{data['flexible'][0].split(' (')[0]}»."})
+    if data["fixed"]:
+        count = len(data["fixed"])
+        found.append({"kind": "info", "title": "Неподвижные дела", "text": f"{count} {plural(count, 'задачу', 'задачи', 'задач')} нельзя переносить — остальное планируйте вокруг них."})
+    if not found:
+        found.append({"kind": "success", "title": "План сбалансирован", "text": "Нагрузка распределена ровно. Добавляйте задачи в свободные дни."})
+    return found[:3]
+
+
+# ---------- the evening summary ----------
+
+
+async def movable_unfinished(session: AsyncSession, user: User, now: datetime) -> list[Event]:
+    """Unfinished one-off tasks without time from today and the last days: they can go to tomorrow."""
+    tz = now.tzinfo
+    today = now.date()
+    events = await tasks.events_between(session, user, datetime.combine(today - timedelta(days=OVERDUE_DAYS), time.min, tz), datetime.combine(today + timedelta(days=1), time.min, tz))
+    return [
+        event
+        for event in events
+        if event.all_day and event.completed_at is None and not event.series_id and not tasks.is_fixed(event) and event.start_at.astimezone(tz).date() <= today
+    ][:MAX_MOVE_SUGGESTIONS]
+
+
+async def evening(session: AsyncSession, user: User, now: datetime) -> tuple[str, dict] | None:
+    """Text and button payload for the evening summary: today's progress, what is left, tomorrow's plan."""
+    tz = now.tzinfo
+    today = now.date()
+    tomorrow = today + timedelta(days=1)
+    todays = await tasks.events_between(session, user, datetime.combine(today, time.min, tz), datetime.combine(tomorrow, time.min, tz))
+    upcoming = await tasks.events_between(session, user, datetime.combine(tomorrow, time.min, tz), datetime.combine(tomorrow + timedelta(days=1), time.min, tz))
+    unfinished = await movable_unfinished(session, user, now)
+    if not todays and not upcoming and not unfinished:
+        return None
+    profile = user.profile or {}
+    tone = profile.get("toneOfVoice") if isinstance(profile, dict) else None
+    done = sum(tasks.is_done(event, now) for event in todays)
+    streak, _ = await tasks.streaks(session, user, now)
+    lines = [f"🌙 <b>{EVENING_GREETINGS.get(tone, 'Итоги дня')}</b>", ""]
+    if todays:
+        progress = f"✅ Выполнено {done} из {len(todays)}"
+        if streak >= 2:
+            progress += f" · 🔥 серия {streak} {plural(streak, 'день', 'дня', 'дней')}"
+        lines.append(progress)
+        if done == len(todays):
+            lines.append("Все задачи дня выполнены — отличная работа! 🎉")
+    else:
+        lines.append("Сегодня задач не было.")
+    if unfinished:
+        lines += ["", f"⏳ <b>Не успели</b> — {len(unfinished)}:"]
+        for event in unfinished[:MAX_EVENING_ITEMS]:
+            lines.append(f"• {html.escape(event.title)}")
+        if len(unfinished) > MAX_EVENING_ITEMS:
+            lines.append(f"• …и ещё {len(unfinished) - MAX_EVENING_ITEMS}")
+        lines.append("Перенести их на завтра?")
+    lines += ["", f"📅 <b>План на завтра</b> · {WEEKDAYS_SHORT[tomorrow.weekday()]}, {tomorrow.day} {MONTHS[tomorrow.month - 1]}"]
+    if upcoming:
+        for event in upcoming[:MAX_EVENING_ITEMS]:
+            when = "без времени" if event.all_day else f"{event.start_at.astimezone(tz):%H:%M}"
+            lines.append(f"<code>{when}</code>  {html.escape(event.title)}")
+        if len(upcoming) > MAX_EVENING_ITEMS:
+            lines.append(f"…и ещё {len(upcoming) - MAX_EVENING_ITEMS}")
+    else:
+        lines.append("Пока свободно — напишите мне, что запланировать 🌿")
+    payload = {"event_ids": [event.id for event in unfinished], "target": tomorrow.isoformat(), "target_label": "завтра"}
+    return "\n".join(lines), payload
+
+
+# ---------- moves the assistant proposes after an analysis ----------
+
+MAX_PLAN_MOVES = 6
+
+
+async def plan_moves(session: AsyncSession, user: User, now: datetime, first: date, last: date) -> list[tuple[Event, date]]:
+    """Flexible tasks to move off overloaded days and out of the past, each to the least busy working day
+    before its deadline. Fixed, recurring and timed tasks stay where they are."""
+    tz = now.tzinfo
+    today = now.date()
+    start = max(first, today)
+    horizon = max(last, today + timedelta(days=6))
+    events = await tasks.events_between(
+        session, user, datetime.combine(today - timedelta(days=OVERDUE_DAYS), time.min, tz), datetime.combine(horizon + timedelta(days=1), time.min, tz), limit=3000
+    )
+    load: dict[date, int] = {}
+    for event in events:
+        day = event.start_at.astimezone(tz).date()
+        if day >= today and event.completed_at is None:
+            load[day] = load.get(day, 0) + (tasks.UNTIMED_TASK_MINUTES if event.all_day else int((event.end_at - event.start_at).total_seconds() // 60))
+    workdays = work_days(user.profile or {})
+    candidates = [today + timedelta(days=offset) for offset in range(1, (horizon - today).days + 1) if (today + timedelta(days=offset)).weekday() in workdays]
+    candidates = candidates or [today + timedelta(days=1)]
+
+    def flexible(event: Event) -> bool:
+        return event.all_day and event.completed_at is None and not event.series_id and not tasks.is_fixed(event)
+
+    overdue = [event for event in events if flexible(event) and event.start_at.astimezone(tz).date() < today]
+    busy_days = [day for day, minutes in sorted(load.items()) if start <= day <= last and minutes > 6 * 60]
+    crowded = [event for event in events if flexible(event) and event.start_at.astimezone(tz).date() in busy_days]
+    moves: list[tuple[Event, date]] = []
+    for event in [*overdue, *crowded][:MAX_PLAN_MOVES]:
+        current = event.start_at.astimezone(tz).date()
+        deadline = event.deadline_at.astimezone(tz).date() if event.deadline_at else None
+        options = [day for day in candidates if day != current and (deadline is None or day <= deadline)] or ([today] if current < today else [])
+        if not options:
+            continue
+        target = min(options, key=lambda day: (load.get(day, 0), day))
+        if current in load:
+            load[current] -= tasks.UNTIMED_TASK_MINUTES
+        load[target] = load.get(target, 0) + tasks.UNTIMED_TASK_MINUTES
+        moves.append((event, target))
+    return moves

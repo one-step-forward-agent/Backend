@@ -53,8 +53,8 @@ def fake_gigachat(monkeypatch):
 
     replies = {}
 
-    async def process_message(self, text, timezone="Europe/Moscow", context=""):
-        return {"events": replies["events"], "answer": replies.get("answer")}
+    async def process_message(self, text, timezone="Europe/Moscow", context="", calendar=""):
+        return {"events": replies["events"], "answer": replies.get("answer"), "intent": replies.get("intent")}
 
     async def chat_reply(self, *args, **kwargs):
         return "Ответ ассистента"
@@ -63,8 +63,9 @@ def fake_gigachat(monkeypatch):
     monkeypatch.setattr(gigachat.GigaChatClient, "process_message", process_message)
     monkeypatch.setattr(gigachat.GigaChatClient, "chat_reply", chat_reply)
 
-    def configure(events, answer=None):
+    def configure(events, answer=None, intent=None):
         replies["events"] = events
         replies["answer"] = answer
+        replies["intent"] = intent
 
     return configure

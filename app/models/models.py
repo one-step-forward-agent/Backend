@@ -1,7 +1,7 @@
 from datetime import datetime, time
 from enum import StrEnum
 
-from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, String, Text, Time, UniqueConstraint, func
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, SmallInteger, String, Text, Time, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
@@ -112,11 +112,26 @@ class Event(Base):
     recurrence_rule: Mapped[str | None] = mapped_column(Text)
     series_id: Mapped[str | None] = mapped_column(String(36), index=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # The latest moment the task must be done by; independent of when it is planned
+    deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    # A task that cannot be moved (a meeting, an exam): suggestions plan around it
+    is_fixed: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    tag_ids: Mapped[list[int]] = mapped_column(ARRAY(Integer), default=list, server_default="{}")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     calendar: Mapped[Calendar] = relationship(back_populates="events")
     user: Mapped[User] = relationship(back_populates="events")
     metadata_record: Mapped["EventMetadata | None"] = relationship(back_populates="event", cascade="all, delete-orphan", uselist=False)
+
+
+class Tag(Base):
+    __tablename__ = "tags"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(EncryptedText("tags.name"))
+    color: Mapped[str] = mapped_column(String(20), default="indigo", server_default="indigo")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class EventMetadata(Base):
@@ -185,6 +200,9 @@ class ReminderSettings(Base):
     sources: Mapped[list[str]] = mapped_column(ARRAY(String(20)), default=list)
     checkin_enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
     checkin_time: Mapped[time] = mapped_column(Time, default=time(13, 0), server_default="13:00")
+    evening_enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
+    evening_time: Mapped[time] = mapped_column(Time, default=time(21, 0), server_default="21:00")
+    deadline_enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     user: Mapped[User] = relationship(back_populates="reminder_settings")
 
@@ -232,6 +250,9 @@ class ConversationMessage(Base):
     reply: Mapped[dict | None] = mapped_column(EncryptedJSON("conversation_messages.reply"))
     # The draft this reply proposed; confirming or editing the draft updates the message
     draft_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    # The user's 👍 (1) or 👎 (-1) for an assistant answer
+    rating: Mapped[int | None] = mapped_column(SmallInteger)
+    rated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
 
 
@@ -250,12 +271,15 @@ class AssistantDraft(Base):
 
 
 class RecommendationCache(Base):
-    """The last recommendations per user, reused until the plan changes (see insights.cache_key)."""
+    """The last recommendations per user and screen, reused until the plan changes (see insights.cache_key)."""
 
     __tablename__ = "recommendation_cache"
+    __table_args__ = (UniqueConstraint("user_id", "scope", name="uq_recommendation_cache_user_scope"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), unique=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    # "today", or a calendar period such as "week:2026-10-05" or "month:2026-10-01"
+    scope: Mapped[str] = mapped_column(String(40), default="today", server_default="today")
     key: Mapped[str] = mapped_column(String(64))
     items: Mapped[list[dict]] = mapped_column(EncryptedJSON("recommendation_cache.items"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))

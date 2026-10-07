@@ -56,6 +56,7 @@ ENCRYPTED_COLUMNS = (
     ("conversation_messages", "reply", "json"),
     ("assistant_drafts", "items", "json"),
     ("recommendation_cache", "items", "json"),
+    ("tags", "name", "text"),
 )
 UNREADABLE = "[не удалось расшифровать]"
 

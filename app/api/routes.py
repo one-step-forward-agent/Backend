@@ -1,6 +1,6 @@
 import subprocess
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Literal
 from uuid import uuid4
 
@@ -8,14 +8,14 @@ import httpx
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response
-from sqlalchemy import select
+from sqlalchemy import any_, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
 from app.core import ratelimit
 from app.core.config import settings
 from app.core.database import get_session
-from app.models.models import Calendar, Event, EventFile, Integration, User
+from app.models.models import Calendar, Event, EventFile, Integration, Tag, User
 from app.schemas import (
     AssistantConfirmation,
     AssistantMessage,
@@ -23,13 +23,19 @@ from app.schemas import (
     CalendarCreate,
     CalendarRead,
     ChatRequest,
+    ChatTopic,
     CompleteRequest,
+    RatingRequest,
+    UndoRequest,
     DraftUpdate,
     EventCreate,
     EventRead,
     EventUpdate,
     MoveRequest,
     OnboardingProfile,
+    TagCreate,
+    TagRead,
+    TagUpdate,
     UserRead,
     UserUpdate,
 )
@@ -52,6 +58,7 @@ def limit_assistant(user: User) -> None:
 
 def limit_uploads(user: User) -> None:
     ratelimit.hit(f"uploads:{user.id}", UPLOAD_LIMIT, UPLOAD_WINDOW, "Слишком много файлов, попробуйте через час")
+MAX_TAGS = 50
 ALLOWED_EXTENSIONS = {"pdf", "doc", "docx", "xls", "xlsx", "png", "jpg", "jpeg"}
 AUDIO_EXTENSIONS = {".webm", ".ogg", ".oga", ".opus", ".mp3", ".m4a", ".mp4", ".wav", ".aac"}
 
@@ -68,6 +75,13 @@ async def _owned_event(session: AsyncSession, user: User, event_id: int) -> Even
     if not event or event.user_id != user.id:
         raise HTTPException(status_code=404, detail="Event not found")
     return event
+
+
+async def _owned_tag(session: AsyncSession, user: User, tag_id: int) -> Tag:
+    tag = await session.get(Tag, tag_id)
+    if not tag or tag.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Тег не найден")
+    return tag
 
 
 async def _owned_file(session: AsyncSession, user: User, file_id: int) -> EventFile:
@@ -136,6 +150,7 @@ async def create_event(payload: EventCreate, user: User = Depends(get_current_us
     values["recurrence_rule"] = valid_rrule(values.get("recurrence_rule"))
     if payload.recurrence_rule and not values["recurrence_rule"]:
         raise HTTPException(status_code=422, detail="Invalid recurrence rule")
+    values["tag_ids"] = await tasks.owned_tag_ids(session, user, values.get("tag_ids"))
     calendar = await _owned_calendar(session, user, calendar_id) if calendar_id else await default_calendar(session, user, payload.timezone)
     event = Event(calendar_id=calendar.id, user_id=user.id, **values)
     session.add(event)
@@ -153,6 +168,7 @@ async def list_events(
     start: datetime | None = None,
     end: datetime | None = None,
     limit: int = 200,
+    tag: int | None = None,
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ):
@@ -161,6 +177,8 @@ async def list_events(
         query = query.where(Event.end_at >= start)
     if end is not None:
         query = query.where(Event.start_at < end)
+    if tag is not None:
+        query = query.where(tag == any_(Event.tag_ids))
     return list((await session.scalars(query)).all())
 
 
@@ -173,6 +191,10 @@ async def get_event(event_id: int, user: User = Depends(get_current_user), sessi
 async def update_event(event_id: int, payload: EventUpdate, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
     event = await _owned_event(session, user, event_id)
     values = payload.model_dump(exclude_unset=True)
+    if "tag_ids" in values:
+        values["tag_ids"] = await tasks.owned_tag_ids(session, user, values["tag_ids"])
+    if values.get("is_fixed") is None:
+        values.pop("is_fixed", None)
     for key, value in values.items():
         setattr(event, key, value)
     if event.end_at <= event.start_at:
@@ -217,8 +239,59 @@ async def stats(days: int = 7, user: User = Depends(get_current_user), session: 
 
 
 @router.get("/recommendations")
-async def recommendations(user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
-    return {"items": await insights.recommendations(session, user)}
+async def recommendations(
+    scope: Literal["today", "week", "month"] = "today",
+    day: date | None = None,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """Two recommendations for today, or scheduling advice for the calendar week or month around `day`."""
+    return {"items": await insights.recommendations(session, user, scope, day)}
+
+
+@router.get("/tags", response_model=list[TagRead])
+async def list_tags(user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    return list(await session.scalars(select(Tag).where(Tag.user_id == user.id).order_by(Tag.id)))
+
+
+async def _ensure_unique_tag(session: AsyncSession, user: User, name: str, exclude: int | None = None) -> None:
+    # Names are encrypted at rest, so they are compared after loading
+    for tag in await session.scalars(select(Tag).where(Tag.user_id == user.id)):
+        if tag.id != exclude and tag.name.lower() == name.lower():
+            raise HTTPException(status_code=409, detail="Такой тег уже есть")
+
+
+@router.post("/tags", response_model=TagRead, status_code=status.HTTP_201_CREATED)
+async def create_tag(payload: TagCreate, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    if await session.scalar(select(func.count()).select_from(Tag).where(Tag.user_id == user.id)) >= MAX_TAGS:
+        raise HTTPException(status_code=422, detail=f"Можно создать не больше {MAX_TAGS} тегов")
+    await _ensure_unique_tag(session, user, payload.name)
+    tag = Tag(user_id=user.id, name=payload.name, color=payload.color)
+    session.add(tag)
+    await session.commit()
+    await session.refresh(tag)
+    return tag
+
+
+@router.patch("/tags/{tag_id}", response_model=TagRead)
+async def update_tag(tag_id: int, payload: TagUpdate, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    tag = await _owned_tag(session, user, tag_id)
+    if payload.name:
+        await _ensure_unique_tag(session, user, payload.name, exclude=tag.id)
+        tag.name = payload.name
+    if payload.color:
+        tag.color = payload.color
+    await session.commit()
+    await session.refresh(tag)
+    return tag
+
+
+@router.delete("/tags/{tag_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_tag(tag_id: int, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    tag = await _owned_tag(session, user, tag_id)
+    await session.execute(update(Event).where(Event.user_id == user.id, tag.id == any_(Event.tag_ids)).values(tag_ids=func.array_remove(Event.tag_ids, tag.id)))
+    await session.delete(tag)
+    await session.commit()
 
 
 @router.post("/assistant/chat")
@@ -228,6 +301,33 @@ async def assistant_chat(payload: ChatRequest, user: User = Depends(get_current_
         return await chat.handle_message(session, user, payload.text)
     except chat.AssistantUnavailable:
         raise HTTPException(status_code=503, detail="Временная ошибка — попробуйте ещё раз через минуту") from None
+
+
+@router.post("/assistant/topic")
+async def assistant_topic(payload: ChatTopic, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    """Open the chat about a recommendation: it is kept as the assistant's message and as context for the reply."""
+    return await chat.remember_topic(session, user, payload.title, payload.text)
+
+
+@router.get("/assistant/agenda/{scope}")
+async def assistant_agenda(scope: Literal["today", "tomorrow", "week"], mark: bool = False, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    """The same plan the bot shows under its buttons; mark=true shows it as a checklist."""
+    return await chat.agenda(session, user, scope, mark=mark)
+
+
+@router.post("/assistant/undo")
+async def assistant_undo(payload: UndoRequest, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    """"Отменить" under a confirmed draft: removes the tasks it just created (as the bot's button does)."""
+    return {"deleted": await chat.undo(session, user, payload.event_ids)}
+
+
+@router.post("/assistant/messages/{message_id}/rating")
+async def rate_answer(message_id: int, payload: RatingRequest, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    """👍 / 👎 for an assistant answer (0 removes the rating)."""
+    try:
+        return await chat.rate(session, user, message_id, payload.value)
+    except LookupError:
+        raise HTTPException(status_code=404, detail="Сообщение не найдено") from None
 
 
 @router.get("/assistant/history")

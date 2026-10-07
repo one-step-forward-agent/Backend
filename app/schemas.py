@@ -136,6 +136,9 @@ class EventCreate(BaseModel):
     all_day: bool = False
     reminder_minutes: int | None = Field(default=None, ge=0, le=10080)
     recurrence_rule: str | None = Field(default=None, max_length=200)
+    deadline_at: datetime | None = None
+    is_fixed: bool = False
+    tag_ids: list[int] = Field(default_factory=list, max_length=20)
 
 
 class EventUpdate(BaseModel):
@@ -148,6 +151,9 @@ class EventUpdate(BaseModel):
     location: str | None = Field(default=None, max_length=500)
     all_day: bool | None = None
     reminder_minutes: int | None = Field(default=None, ge=0, le=10080)
+    deadline_at: datetime | None = None
+    is_fixed: bool | None = None
+    tag_ids: list[int] | None = Field(default=None, max_length=20)
 
 
 class EventRead(EventCreate):
@@ -161,6 +167,39 @@ class EventRead(EventCreate):
     external_id: str | None = None
     series_id: str | None = None
     completed_at: datetime | None = None
+
+
+TAG_COLORS = ("indigo", "blue", "green", "amber", "red", "pink", "violet", "slate")
+
+
+class TagCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=40)
+    color: Literal[TAG_COLORS] = "indigo"
+
+    @field_validator("name")
+    @classmethod
+    def strip_name(cls, value: str) -> str:
+        value = " ".join(value.split()).lstrip("#")
+        if not value:
+            raise ValueError("Введите название тега")
+        return value
+
+
+class TagUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=40)
+    color: Literal[TAG_COLORS] | None = None
+
+    @field_validator("name")
+    @classmethod
+    def strip_name(cls, value: str | None) -> str | None:
+        return None if value is None else TagCreate.strip_name(value)
+
+
+class TagRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    name: str
+    color: str
 
 
 class AssistantMessage(BaseModel):
@@ -196,6 +235,9 @@ class ReminderSettingsBase(BaseModel):
     sources: list[Provider] = Field(default_factory=list)
     checkin_enabled: bool = True
     checkin_time: time = time(13, 0)
+    evening_enabled: bool = True
+    evening_time: time = time(21, 0)
+    deadline_enabled: bool = True
 
     @field_validator("lead_times")
     @classmethod
@@ -218,6 +260,9 @@ class ReminderSettingsUpdate(BaseModel):
     sources: list[Provider] | None = None
     checkin_enabled: bool | None = None
     checkin_time: time | None = None
+    evening_enabled: bool | None = None
+    evening_time: time | None = None
+    deadline_enabled: bool | None = None
 
     @field_validator("lead_times")
     @classmethod
@@ -304,6 +349,29 @@ class MoveRequest(BaseModel):
 
 class ChatRequest(BaseModel):
     text: str = Field(min_length=1, max_length=50000)
+
+
+class RatingRequest(BaseModel):
+    value: Literal[-1, 0, 1]
+
+
+class BotRatingRequest(RatingRequest):
+    pass
+
+
+class UndoRequest(BaseModel):
+    event_ids: list[int] = Field(min_length=1, max_length=500)
+
+
+class BotTopicRequest(BaseModel):
+    index: int = Field(ge=0, lt=5)
+
+
+class ChatTopic(BaseModel):
+    """A recommendation the user opened the chat from; the assistant keeps it as context."""
+
+    title: str = Field(min_length=1, max_length=120)
+    text: str = Field(min_length=1, max_length=600)
 
 
 class DraftUpdate(BaseModel):

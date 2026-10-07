@@ -47,6 +47,8 @@ class Parsed:
     time: time | None = None
     end_time: time | None = None
     rrule: str | None = None
+    # The last day of a multi-day event ("с 10 по 12 октября")
+    end_date: date | None = None
     spans: list[tuple[int, int]] = field(default_factory=list)
 
     @property
@@ -97,7 +99,7 @@ def parse_time(text: str) -> tuple[time | None, time | None, list[tuple[int, int
     """Start time, end time and the matched spans of a phrase such as "с 10 до 12:30"."""
     low = text.lower()
     patterns = (
-        rf"\bс\s+(\d{{1,2}})(?:[:.](\d{{2}}))?\s*(?:часов\s+)?(?:до|по)\s+(\d{{1,2}})(?:[:.](\d{{2}}))?(?!\s*{NOT_HOUR})",
+        rf"\bс\s+(\d{{1,2}})(?:[:.](\d{{2}}))?\s*(?:часов\s+)?(?:до|по)\s+(\d{{1,2}})(?!\d)(?:[:.](\d{{2}}))?(?!\d)(?!\s*{NOT_HOUR})",
         r"\b(\d{1,2}):(\d{2})\s*(?:-|–|—|до)\s*(\d{1,2}):(\d{2})\b",
     )
     for pattern in patterns:
@@ -203,6 +205,47 @@ def _weekday_date(low: str, today: date) -> tuple[date | None, tuple[int, int] |
     return today + timedelta(days=(weekday - today.weekday()) % 7 or 7), match.span()
 
 
+def _range_part(text: str, today: date) -> date | None:
+    """A single date in one side of a range: "12 октября", "пятницы", "завтра"."""
+    low = text.strip().lower()
+    found, _ = _explicit_date(low, today)
+    if found:
+        return found
+    if re.fullmatch(r"послезавтра", low):
+        return today + timedelta(days=2)
+    if re.fullmatch(r"завтра", low):
+        return today + timedelta(days=1)
+    if re.fullmatch(r"сегодня", low):
+        return today
+    found, _ = _weekday_date(low, today)
+    return found
+
+
+def _date_range(low: str, today: date) -> tuple[date | None, date | None, tuple[int, int] | None]:
+    """First and last day of "с 10 по 12 октября", "10–12 октября", "с понедельника по среду"."""
+    same_month = (
+        rf"\b(?:с\s+)?(\d{{1,2}})\s*(?:-|–|—|по|до)\s*(\d{{1,2}})(?:-?го)?\s+({MONTH_FORMS})\b(?:\s+(\d{{4}}))?"
+    )
+    if match := re.search(same_month, low):
+        if match.group(0).lstrip().startswith("с") or re.search(r"[-–—]", match.group(0)):
+            year = int(match.group(4) or today.year)
+            month = _month(match.group(3))
+            first, last = _safe_date(year, month, int(match.group(1))), _safe_date(year, month, int(match.group(2)))
+            if first and last and not match.group(4) and last < today:
+                first, last = _safe_date(year + 1, month, first.day), _safe_date(year + 1, month, last.day)
+            if first and last and last > first:
+                return first, last, match.span()
+    side = rf"(?:\d{{1,2}}(?:-?го)?\s+(?:{MONTH_FORMS})|\d{{1,2}}[./]\d{{1,2}}(?:[./]\d{{2,4}})?|(?:{ANY_WEEKDAY})|сегодня|завтра|послезавтра)"
+    if match := re.search(rf"\bс\s+({side})\s+(?:по|до)\s+({side})\b", low):
+        first = _range_part(match.group(1), today)
+        last = _range_part(match.group(2), first or today) if first else None
+        if first and last and last < first and not re.search(r"\d", match.group(2)):
+            last += timedelta(days=7)
+        if first and last and last > first:
+            return first, last, match.span()
+    return None, None, None
+
+
 def parse(text: str, now: datetime) -> Parsed:
     """Date, time, end time and recurrence mentioned in text, relative to now (user's local time)."""
     low = text.lower()
@@ -225,6 +268,11 @@ def parse(text: str, now: datetime) -> Parsed:
         result.spans.append(match.span())
         return result
 
+    first, last, span = _date_range(low, today)
+    if first:
+        result.date, result.end_date = first, last
+        result.spans.append(span)
+        return result
     found, span = _explicit_date(low, today)
     if found is None:
         if match := re.search(r"\bпослезавтра\b", low):

@@ -17,6 +17,8 @@ from app.schemas import (
     BotClaimRequest,
     BotCompleteRequest,
     BotEditRequest,
+    BotRatingRequest,
+    BotTopicRequest,
     BotRemoveRequest,
     BotLinkRequest,
     BotSnoozeRequest,
@@ -67,6 +69,28 @@ async def chat_message(chat_id: int, payload: BotChatRequest, session: AsyncSess
         return await chat.handle_message(session, user, payload.text)
     except chat.AssistantUnavailable:
         raise HTTPException(status_code=503, detail="Assistant is unavailable") from None
+
+
+@router.post("/chat/{chat_id}/messages/{message_id}/rating")
+async def chat_rating(chat_id: int, message_id: int, payload: BotRatingRequest, session: AsyncSession = Depends(get_session)):
+    user = await _user_by_chat(session, chat_id)
+    try:
+        return await chat.rate(session, user, message_id, payload.value)
+    except LookupError:
+        raise HTTPException(status_code=404, detail="Message not found") from None
+
+
+@router.post("/chat/{chat_id}/topic")
+async def chat_topic(chat_id: int, payload: BotTopicRequest, session: AsyncSession = Depends(get_session)):
+    """"Обсудить" under advice in Telegram: the recommendation becomes the topic, as in the web chat."""
+    from app.services import insights
+
+    user = await _user_by_chat(session, chat_id)
+    items = await insights.recommendations(session, user)
+    if payload.index >= len(items):
+        raise HTTPException(status_code=404, detail="Recommendation not found")
+    item = items[payload.index]
+    return await chat.remember_topic(session, user, item["title"], item["text"])
 
 
 @router.get("/chat/{chat_id}/agenda/{scope}")
@@ -200,7 +224,8 @@ async def snooze(notification_id: int, payload: BotSnoozeRequest, session: Async
 async def checkin_action(notification_id: int, payload: BotCheckinRequest, session: AsyncSession = Depends(get_session)):
     notification = await session.get(Notification, notification_id)
     user = await session.get(User, notification.user_id) if notification else None
-    if not notification or notification.kind != "checkin" or not user or user.telegram_chat_id != payload.chat_id:
+    # The midday check-in and the evening summary both offer to move tasks
+    if not notification or notification.kind not in ("checkin", "evening") or not user or user.telegram_chat_id != payload.chat_id:
         raise HTTPException(status_code=404, detail="Notification not found")
     data = notification.payload or {}
     if payload.action == "ok" or not data.get("event_ids"):
