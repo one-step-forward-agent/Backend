@@ -90,6 +90,12 @@ HONEST_ANSWER = (
     "«перенеси отчёт на пятницу» или «отметь отчёт выполненным», и я покажу изменение на подтверждение."
 )
 MAX_DELETE = 5000
+# "Добавь …" already says what to do: a single clear task is added at once, with an undo button
+ADD_REQUEST = re.compile(
+    r"^\s*(?:dayla[,!]?\s+)?(?:пожалуйста[,]?\s+)?(?:добавь|добавить|создай|создать|запиши|записать|запланируй|запланировать|поставь|поставить)\b",
+    re.I,
+)
+SUPERSEDED_TEXT = "Черновик закрыт: вы отправили новый запрос."
 # Quick commands work the same in the web chat and in Telegram: typed, from a menu button or as /command
 COMMANDS = {
     "today": ("/today", "сегодня", "план на сегодня", "что сегодня", "на сегодня"),
@@ -126,6 +132,7 @@ STOP_WORDS = {
     "запланирована", "запланирован", "назначено", "назначена", "назначен", "время", "часов", "пожалуйста", "напомни",
     "все", "всё", "всех", "list", "about", "расскажи", "расскажите", "подскажи", "скажи", "покажите", "посмотри",
     "про", "обо", "свободен", "свободна", "занят", "занята", "планирую", "запланировал", "запланировала", "моих", "моя",
+    "там", "тут", "это", "этим", "этой", "чем", "насчет", "насчёт", "как", "идет", "идёт", "дела", "делами",
 }
 _stemmer = snowballstemmer.stemmer("russian")
 
@@ -652,10 +659,10 @@ async def create_draft(session: AsyncSession, user: User, items: list[dict]) -> 
     await session.execute(
         delete(AssistantDraft).where(AssistantDraft.user_id == user.id, AssistantDraft.created_at < datetime.now(timezone.utc) - DRAFT_LIFETIME)
     )
-    # Only the newest draft can wait for an edit
-    drafts = await session.scalars(select(AssistantDraft).where(AssistantDraft.user_id == user.id, AssistantDraft.awaiting.is_not(None)))
-    for old in drafts:
-        old.awaiting = None
+    # A new request closes drafts left unconfirmed, so they are not offered again and again
+    for old in list(await session.scalars(select(AssistantDraft).where(AssistantDraft.user_id == user.id))):
+        await update_draft_messages(session, user, old.id, {"kind": "cancelled", "text": SUPERSEDED_TEXT})
+        await session.delete(old)
     draft = AssistantDraft(user_id=user.id, items=items[:MAX_DRAFT_ITEMS], awaiting=None)
     session.add(draft)
     await session.commit()
@@ -674,7 +681,8 @@ async def pending_edit(session: AsyncSession, user: User) -> AssistantDraft | No
     since = datetime.now(timezone.utc) - EDIT_TIMEOUT
     return await session.scalar(
         select(AssistantDraft)
-        .where(AssistantDraft.user_id == user.id, AssistantDraft.awaiting.is_not(None), AssistantDraft.updated_at >= since)
+        # Older rows keep a JSON null instead of SQL NULL, so only a real {"index", "field"} object counts
+        .where(AssistantDraft.user_id == user.id, func.jsonb_typeof(AssistantDraft.awaiting) == "object", AssistantDraft.updated_at >= since)
         .order_by(AssistantDraft.updated_at.desc())
         .limit(1)
     )
@@ -737,8 +745,27 @@ def edit_item(item: dict, field: str, value: str, now: datetime) -> tuple[dict |
     return item, None
 
 
-async def apply_edit_text(session: AsyncSession, user: User, draft: AssistantDraft, text: str, tz: ZoneInfo) -> dict:
+def looks_like_new_request(text: str, field: str | None) -> bool:
+    """While a draft waits for a new title, date or time, a question or another request is not that value."""
+    if is_question(text) or command(text) or is_delete_request(text) or is_complete_request(text) or is_change_request(text) or ANALYZE_REQUEST.search(text):
+        return True
+    if field == "title":
+        return bool(ADD_REQUEST.match(text))
+    # A new date or time is short ("завтра", "в 18:00"); a whole sentence is a new message
+    return len(text.split()) > 6 or bool(ADD_REQUEST.match(text))
+
+
+async def apply_edit_text(session: AsyncSession, user: User, draft: AssistantDraft, text: str, tz: ZoneInfo) -> dict | None:
+    """The new value of the field the draft waits for, or None when the message is something else."""
     awaiting = draft.awaiting or {}
+    if awaiting.get("field") not in EDIT_PROMPTS:
+        draft.awaiting = None
+        await session.commit()
+        return None
+    if text.strip().lower() not in CANCEL_WORDS and looks_like_new_request(text, awaiting.get("field")):
+        draft.awaiting = None
+        await session.commit()
+        return None
     if text.strip().lower() in CANCEL_WORDS:
         draft.awaiting = None
         await session.commit()
@@ -1219,7 +1246,9 @@ async def route(session: AsyncSession, user: User, text: str, tz: ZoneInfo, hist
     """Recognized actions run here and never depend on what the model writes about them."""
     draft = await pending_edit(session, user)
     if draft:
-        return await apply_edit_text(session, user, draft, text, tz)
+        reply = await apply_edit_text(session, user, draft, text, tz)
+        if reply is not None:
+            return reply
     name = command(text)
     if name:
         return await run_command(session, user, name)
@@ -1254,7 +1283,11 @@ async def route(session: AsyncSession, user: User, text: str, tz: ZoneInfo, hist
         answer = None
     if items:
         await apply_hashtags(session, user, items, text)
-        return proposal(await create_draft(session, user, items), tz, answer=honest(answer))
+        draft = await create_draft(session, user, items)
+        if ADD_REQUEST.match(text) and len(items) == 1:
+            # The user already said "добавь": add it now; "Отменить" is under the answer
+            return await confirm_draft(session, user, draft.id)
+        return proposal(draft, tz, answer=honest(answer))
     if not answer and settings.gigachat_credentials:
         from services.gigachat import GigaChatClient
 

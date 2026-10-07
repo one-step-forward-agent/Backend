@@ -119,6 +119,18 @@ def parse_time(text: str) -> tuple[time | None, time | None, list[tuple[int, int
         return _clock(_hour(int(match.group(1)), match.group(3)), int(match.group(2))), None, [match.span()]
     if match := re.search(r"\b(?:в|к|на)\s+(\d{1,2})\.(\d{2})\b(?!\.\d)", low):
         return _clock(int(match.group(1)), int(match.group(2))), None, [match.span()]
+    # "в 22 00", "в 22-00" (voice input and quick typing); "в 10-12" stays a range of hours
+    if match := re.search(rf"\b(?:в|к|на)\s+(\d{{1,2}})(?:\s+|-)(\d{{2}})(?!\d)(?!\s*{NOT_HOUR})", low):
+        start, second = int(match.group(1)), int(match.group(2))
+        if "-" in match.group(0) and match.group(2) not in ("00", "15", "30", "45") and start < second <= 23:
+            # "в 10-12" is a range of hours
+            return _clock(start, 0), _clock(second, 0), [match.span()]
+        if second <= 59:
+            return _clock(start, second), None, [match.span()]
+    # A bare "22.00" is a time: there is no month 00, and minutes above 12 cannot be a month
+    if match := re.search(r"(?<![\d.:/])(\d{1,2})\.(\d{2})(?![\d.:/])", low):
+        if match.group(2) == "00" or int(match.group(2)) > 12:
+            return _clock(int(match.group(1)), int(match.group(2))), None, [match.span()]
     hour_pattern = rf"\b(?:в|к)\s+(\d{{1,2}})(?:\s*(?:час(?:а|ов)?|ч)\b)?(?:\s+(утра|дня|вечера|ночи))?(?!\s*{NOT_HOUR})(?![\w.:/-])"
     if match := re.search(hour_pattern, low):
         return _clock(_hour(int(match.group(1)), match.group(2)), 0), None, [match.span()]
@@ -275,11 +287,11 @@ def parse(text: str, now: datetime) -> Parsed:
         return result
     found, span = _explicit_date(low, today)
     if found is None:
-        if match := re.search(r"\bпослезавтра\b", low):
+        if match := re.search(r"\b(?:на\s+)?послезавтра\b", low):
             found, span = today + timedelta(days=2), match.span()
-        elif match := re.search(r"\bзавтра\b", low):
+        elif match := re.search(r"\b(?:на\s+)?завтра\b", low):
             found, span = today + timedelta(days=1), match.span()
-        elif match := re.search(r"\bсегодня\b", low):
+        elif match := re.search(r"\b(?:на\s+)?сегодня\b", low):
             found, span = today, match.span()
         elif match := re.search(rf"\bчерез\s+(?:({NUMBER})\s+)?(дн\w*|день|сут\w*|недел\w*|месяц\w*|год\w*|лет)\b", low):
             amount, unit = _number(match.group(1) or "1"), match.group(2)

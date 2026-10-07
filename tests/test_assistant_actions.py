@@ -195,3 +195,42 @@ async def test_web_agenda_matches_the_bot(client, user):
     web = (await client.get("/api/assistant/agenda/tomorrow?mark=true", headers=headers)).json()
     bot = (await client.get(f"/internal/bot/chat/{chat_id}/agenda/tomorrow", headers=BOT_HEADERS)).json()
     assert web.pop("mark") is True and web == bot
+
+
+async def test_explicit_add_creates_at_once_with_a_clean_title(client, user):
+    headers, _ = user
+    for text in ["добавь моделирование 2 кустов на завтра в 22 00", "добавь полив сада на завтра в 21-00", "запиши звонок маме на завтра 19.30"]:
+        reply = await chat(client, headers, text)
+        assert reply["kind"] == "created", (text, reply)
+        [event] = reply["events"]
+        assert event["title"] in ("Моделирование 2 кустов", "Полив сада", "Звонок маме"), event["title"]
+        assert event["time"] in ("22:00", "21:00", "19:30")
+        assert reply["event_ids"]  # the undo button needs them
+    # Without "добавь" the task still waits for confirmation
+    assert (await chat(client, headers, "купить хлеб завтра"))["kind"] == "proposal"
+
+
+async def test_a_question_is_not_taken_for_the_awaited_time(client, user):
+    headers, chat_id = user
+    await chat(client, headers, "добавь моделирование 2 кустов на завтра в 22:00")
+    draft = (await client.post(f"/internal/bot/chat/{chat_id}", json={"text": "полить кусты завтра"}, headers=BOT_HEADERS)).json()
+    await client.post(f"/internal/bot/chat/{chat_id}/drafts/{draft['draft_id']}/edit", json={"index": 0, "field": "time"}, headers=BOT_HEADERS)
+
+    reply = (await client.post(f"/internal/bot/chat/{chat_id}", json={"text": "что там с моделированием завтра?"}, headers=BOT_HEADERS)).json()
+    assert reply["kind"] == "agenda", reply
+    assert [event["title"] for day in reply["days"] for event in day["events"]] == ["Моделирование 2 кустов"]
+    # A short value still edits the draft
+    await client.post(f"/internal/bot/chat/{chat_id}/drafts/{draft['draft_id']}/edit", json={"index": 0, "field": "time"}, headers=BOT_HEADERS)
+    edited = (await client.post(f"/internal/bot/chat/{chat_id}", json={"text": "в 18:00"}, headers=BOT_HEADERS)).json()
+    assert edited["kind"] == "proposal" and edited["events"][0]["time"] == "18:00"
+
+
+async def test_a_new_request_closes_the_unconfirmed_draft(client, user):
+    headers, _ = user
+    first = await chat(client, headers, "купить хлеб завтра")
+    second = await chat(client, headers, "забрать посылку послезавтра")
+    assert (await client.post(f"/api/assistant/drafts/{first['draft_id']}/confirm", headers=headers)).status_code == 404
+    history = (await client.get("/api/assistant/history", headers=headers)).json()
+    closed = [item["reply"] for item in history if item["reply"] and item["reply"].get("text") == "Черновик закрыт: вы отправили новый запрос."]
+    assert len(closed) == 1
+    assert (await client.post(f"/api/assistant/drafts/{second['draft_id']}/confirm", headers=headers)).json()["kind"] == "created"

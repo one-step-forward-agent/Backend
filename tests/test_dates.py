@@ -148,3 +148,19 @@ def test_parser_is_fast_on_long_adversarial_input():
         started = clock.perf_counter()
         parse(sample[:50000], NOW)
         assert clock.perf_counter() - started < 1.0, sample[:20]
+
+
+def test_times_written_with_a_space_dash_or_bare_dot():
+    from datetime import datetime, time
+    from zoneinfo import ZoneInfo
+
+    from app.services import dates
+
+    now = datetime(2026, 10, 7, 13, 0, tzinfo=ZoneInfo("Europe/Moscow"))
+    assert dates.parse("в 22 00", now).time == time(22, 0)
+    assert dates.parse("в 21-00", now).time == time(21, 0)
+    assert dates.parse("завтра 19.30", now).time == time(19, 30)
+    ranged = dates.parse("в 10-12", now)
+    assert (ranged.time, ranged.end_time) == (time(10, 0), time(12, 0))  # a range of hours, not 10:12
+    assert dates.parse("10.11", now).date is not None and dates.parse("10.11", now).time is None  # a date
+    assert dates.parse("в 10 15 октября", now).time == time(10, 0)

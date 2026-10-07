@@ -265,7 +265,8 @@ class AssistantDraft(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     items: Mapped[list[dict]] = mapped_column(EncryptedJSON("assistant_drafts.items"))
     # {"index": n, "field": "title" | "date" | "time"} while the bot waits for a new value
-    awaiting: Mapped[dict | None] = mapped_column(JSONB)
+    # none_as_null: "not waiting" must be SQL NULL — JSON null made every draft look like it waited for an edit
+    awaiting: Mapped[dict | None] = mapped_column(JSONB(none_as_null=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
