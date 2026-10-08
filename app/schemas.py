@@ -412,8 +412,10 @@ class BotRemoveRequest(BaseModel):
     index: int = Field(ge=0, lt=40)
 
 
-class DraftTarget(BaseModel):
-    target: str = Field(min_length=1, max_length=30)
+class DraftCalendars(BaseModel):
+    """The ticked calendars; empty: Dayla only."""
+
+    calendars: list[str] = Field(max_length=10)
 
 
 class BotCheckinRequest(BaseModel):

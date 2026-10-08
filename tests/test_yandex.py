@@ -124,7 +124,7 @@ async def test_connect_imports_and_exports(client, user, fake_yandex):
 
     # A task from the chat goes to Yandex Calendar: the connected calendar is the default target
     created = await client.post("/api/assistant/chat", json={"text": "купить хлеб послезавтра в 18:00"}, headers=headers)
-    assert created.json()["target"] == "yandex"
+    assert created.json()["calendars"] == ["yandex"]
     confirmed = (await client.post(f"/api/assistant/drafts/{created.json()['draft_id']}/confirm", headers=headers)).json()
     assert confirmed["note"] == "Добавлено в Яндекс Календарь"
     assert (await client.post(f"/api/integrations/yandex/export/{confirmed['event_ids'][0]}", headers=headers)).status_code == 409

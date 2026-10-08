@@ -23,7 +23,7 @@ from app.schemas import (
     BotLinkRequest,
     BotSnoozeRequest,
     BotUndoRequest,
-    DraftTarget,
+    DraftCalendars,
     MoveToDayRequest,
     ReminderSettingsRead,
     ReminderSettingsUpdate,
@@ -138,11 +138,11 @@ async def draft_show(chat_id: int, draft_id: int, session: AsyncSession = Depend
     return chat.proposal(draft, tasks.local_tz(user))
 
 
-@router.post("/chat/{chat_id}/drafts/{draft_id}/target")
-async def draft_target(chat_id: int, draft_id: int, payload: DraftTarget, session: AsyncSession = Depends(get_session)):
+@router.post("/chat/{chat_id}/drafts/{draft_id}/calendars")
+async def draft_calendars(chat_id: int, draft_id: int, payload: DraftCalendars, session: AsyncSession = Depends(get_session)):
     user = await _user_by_chat(session, chat_id)
     try:
-        return await chat.set_target(session, user, draft_id, payload.target)
+        return await chat.set_calendars(session, user, draft_id, payload.calendars)
     except chat.DraftNotFound:
         raise HTTPException(status_code=410, detail="Draft is gone") from None
     except ValueError as error:

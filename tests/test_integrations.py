@@ -261,37 +261,39 @@ async def test_draft_offers_the_connected_calendars(client, user, services):
     headers, _ = user
     connected = await client.post("/api/integrations/apple/connect", json={"values": {"username": "olga@icloud.com", "app_password": "app-pass"}}, headers=headers)
     assert connected.status_code == 200, connected.text
+    await oauth_connect(client, headers, "notion")
     reply = await draft(client, headers, "позвонить маме послезавтра в 18:00")
-    # A connected calendar is the default: it was connected to get the tasks
-    assert [item["slug"] for item in reply["targets"]] == ["dayla", "apple"] and reply["target"] == "apple"
+    # A connected calendar is ticked by default: it was connected to get the tasks; Notion only when ticked
+    assert [item["slug"] for item in reply["targets"]] == ["apple", "notion"] and reply["calendars"] == ["apple"]
     # The draft shows the end its task gets: an hour after the start when none was said
     item = reply["events"][0]
     assert item["end_time"] is None and item["end"][11:16] == "19:00"
 
-    chosen = await client.post(f"/api/assistant/drafts/{reply['draft_id']}/target", json={"target": "apple"}, headers=headers)
-    assert chosen.status_code == 200 and chosen.json()["target"] == "apple"
-    assert (await client.post(f"/api/assistant/drafts/{reply['draft_id']}/target", json={"target": "notion"}, headers=headers)).status_code == 422
+    ticked = await client.post(f"/api/assistant/drafts/{reply['draft_id']}/calendars", json={"calendars": ["notion", "apple"]}, headers=headers)
+    assert ticked.status_code == 200 and ticked.json()["calendars"] == ["apple", "notion"]
+    assert (await client.post(f"/api/assistant/drafts/{reply['draft_id']}/calendars", json={"calendars": ["google"]}, headers=headers)).status_code == 422
     created = (await client.post(f"/api/assistant/drafts/{reply['draft_id']}/confirm", headers=headers)).json()
-    assert created["note"] == "Добавлено в Apple Calendar"
-    assert len(services.created["apple"]) == 1 and "SUMMARY:Позвонить маме" in services.created["apple"][0]
+    assert created["note"] == "Добавлено в Apple Calendar и Notion"
+    assert "SUMMARY:Позвонить маме" in services.created["apple"][0] and services.created["notion"] == ["Позвонить маме"]
     links = (await client.get(f"/api/events/{created['event_ids'][0]}/links", headers=headers)).json()
-    assert [link["provider"] for link in links] == ["apple"]
+    assert sorted(link["provider"] for link in links) == ["apple", "notion"]
 
-    # The choice is remembered for the next draft, also "Dayla only"
+    # The choice is remembered for the next draft, also "Dayla only" (nothing ticked)
+    assert (await draft(client, headers, "купить хлеб завтра"))["calendars"] == ["apple", "notion"]
     reply = await draft(client, headers, "купить хлеб завтра")
-    await client.post(f"/api/assistant/drafts/{reply['draft_id']}/target", json={"target": "dayla"}, headers=headers)
-    assert (await draft(client, headers, "полить цветы завтра"))["target"] == "dayla"
+    await client.post(f"/api/assistant/drafts/{reply['draft_id']}/calendars", json={"calendars": []}, headers=headers)
+    assert (await draft(client, headers, "полить цветы завтра"))["calendars"] == []
 
 
 async def test_draft_to_google_by_default_or_dayla_only(client, user, services):
     headers, _ = user
     await oauth_connect(client, headers, "google")
     reply = await draft(client, headers, "купить хлеб послезавтра в 18:00")
-    assert reply["target"] == "google"
+    assert reply["calendars"] == ["google"]
     created = (await client.post(f"/api/assistant/drafts/{reply['draft_id']}/confirm", headers=headers)).json()
     assert created["note"] == "Добавлено в Google Calendar" and services.created["google"] == ["Купить хлеб"]
 
     reply = await draft(client, headers, "позвонить маме послезавтра в 19:00")
-    await client.post(f"/api/assistant/drafts/{reply['draft_id']}/target", json={"target": "dayla"}, headers=headers)
+    await client.post(f"/api/assistant/drafts/{reply['draft_id']}/calendars", json={"calendars": []}, headers=headers)
     created = (await client.post(f"/api/assistant/drafts/{reply['draft_id']}/confirm", headers=headers)).json()
     assert created["note"] is None and services.created["google"] == ["Купить хлеб"]

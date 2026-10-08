@@ -696,28 +696,25 @@ def item_view(item: dict, index: int, tz: ZoneInfo) -> dict:
     }
 
 
-DAYLA_TARGET = {"slug": "dayla", "title": "Только Dayla"}
 # A long series goes to another calendar only in part: every event there is a separate request
 MAX_EXPORT = 20
 DEFAULT_CALENDARS = ("google", "yandex", "apple")
 
 
 async def calendar_targets(session: AsyncSession, user: User) -> list[dict]:
-    """Where new tasks can go: Dayla only, or also a connected calendar that accepts events."""
+    """The connected calendars that accept events: new tasks are always in Dayla and can also go to any of them."""
     connected = set(await session.scalars(select(Integration.provider).where(Integration.user_id == user.id)))
-    return [DAYLA_TARGET] + [
-        {"slug": slug, "title": provider.title} for slug, provider in PROVIDERS.items() if provider.supports_push and slug in connected
-    ]
+    return [{"slug": slug, "title": provider.title} for slug, provider in PROVIDERS.items() if provider.supports_push and slug in connected]
 
 
-def default_target(user: User, targets: list[dict]) -> str:
-    """The last choice while it is still connected; otherwise a connected calendar (Google first, as before
-    there was a choice), since it was connected to get the tasks. Notion is a database, not a calendar:
-    tasks go there only when it is chosen."""
+def default_calendars(user: User, targets: list[dict]) -> list[str]:
+    """The last choice, as far as it is still connected (an empty one means Dayla only); without one the first
+    connected calendar (Google first, as before there was a choice), since it was connected to get the tasks.
+    Notion is a database, not a calendar: tasks go there only when it is ticked."""
     slugs = [item["slug"] for item in targets]
-    if user.calendar_target in slugs:
-        return user.calendar_target
-    return next((slug for slug in DEFAULT_CALENDARS if slug in slugs), "dayla")
+    if user.calendar_targets is not None:
+        return [slug for slug in user.calendar_targets if slug in slugs]
+    return next(([slug] for slug in DEFAULT_CALENDARS if slug in slugs), [])
 
 
 def proposal(draft: AssistantDraft, tz: ZoneInfo, answer: str | None = None, note: str | None = None) -> dict:
@@ -731,8 +728,8 @@ def proposal(draft: AssistantDraft, tz: ZoneInfo, answer: str | None = None, not
         "answer": answer,
         "note": note,
         "awaiting": draft.awaiting,
-        "target": draft.target or "dayla",
-        "targets": draft.targets or [DAYLA_TARGET],
+        "calendars": draft.calendars or [],
+        "targets": draft.targets or [],
     }
 
 
@@ -745,7 +742,7 @@ async def create_draft(session: AsyncSession, user: User, items: list[dict]) -> 
         await update_draft_messages(session, user, old.id, {"kind": "cancelled", "text": SUPERSEDED_TEXT})
         await session.delete(old)
     targets = await calendar_targets(session, user)
-    draft = AssistantDraft(user_id=user.id, items=items[:MAX_DRAFT_ITEMS], awaiting=None, targets=targets, target=default_target(user, targets))
+    draft = AssistantDraft(user_id=user.id, items=items[:MAX_DRAFT_ITEMS], awaiting=None, targets=targets, calendars=default_calendars(user, targets))
     session.add(draft)
     await session.commit()
     await session.refresh(draft)
@@ -911,49 +908,65 @@ async def replace_items(session: AsyncSession, user: User, draft_id: int, items:
     return reply
 
 
-async def set_target(session: AsyncSession, user: User, draft_id: int, target: str) -> dict:
-    """Choose where the draft's new tasks go; the choice becomes the default for the next drafts."""
+async def set_calendars(session: AsyncSession, user: User, draft_id: int, calendars: list[str]) -> dict:
+    """Tick the calendars the draft's new tasks also go to; the choice becomes the default for the next drafts."""
     draft = await get_draft(session, user, draft_id)
-    if target not in [item["slug"] for item in draft.targets or [DAYLA_TARGET]]:
+    offered = [item["slug"] for item in draft.targets or []]
+    if any(slug not in offered for slug in calendars):
         raise ValueError("Этот календарь не подключён")
-    draft.target = target
-    user.calendar_target = target
+    chosen = [slug for slug in offered if slug in calendars]
+    draft.calendars = chosen
+    user.calendar_targets = chosen
     reply = proposal(draft, tasks.local_tz(user))
     await update_draft_messages(session, user, draft.id, reply)
     await session.commit()
     return reply
 
 
-async def export_new(session: AsyncSession, user: User, target: str | None, ids: list[int]) -> str | None:
-    """Send confirmed new tasks to the draft's calendar; the line about it for the reply."""
-    if not ids or target in (None, "dayla"):
-        return None
-    title = PROVIDERS[target].title if target in PROVIDERS else target
-    events = list(await session.scalars(select(Event).where(Event.id.in_(ids)).order_by(Event.start_at)))
-    if target == "google":
+async def export_to(session: AsyncSession, user: User, slug: str, events: list[Event]) -> str | None:
+    """Send confirmed new tasks to one calendar; None when all went, otherwise what happened."""
+    title = PROVIDERS[slug].title if slug in PROVIDERS else slug
+    if slug == "google":
         # create_tasks has copied them already
-        failed = sum(1 for event in events if event.sync_status == "error")
-        return f"Не удалось добавить в {title} — задачи сохранены в Dayla" if failed else f"Добавлено в {title}"
-    integration = await session.scalar(select(Integration).where(Integration.user_id == user.id, Integration.provider == target))
+        return f"Не удалось добавить в {title}" if any(event.sync_status == "error" for event in events) else None
+    integration = await session.scalar(select(Integration).where(Integration.user_id == user.id, Integration.provider == slug))
     if not integration:
-        return f"{title} не подключён — задачи сохранены только в Dayla"
+        return f"{title} не подключён"
     sent = 0
     for event in events[:MAX_EXPORT]:
         try:
             await integrations.push_event(session, user, integration, event)
         except IntegrationError as error:
-            logger.warning("Export to %s failed for user %s: %s", target, user.id, error)
+            logger.warning("Export to %s failed for user %s: %s", slug, user.id, error)
             await session.rollback()
             reason = plain(str(error))
-            return f"Не удалось добавить в {title}{': ' + reason if reason else ''}. Задачи сохранены в Dayla"
+            return f"Не удалось добавить в {title}{': ' + reason if reason else ''}"
         except Exception:
-            logger.exception("Export to %s failed for user %s", target, user.id)
+            logger.exception("Export to %s failed for user %s", slug, user.id)
             await session.rollback()
-            return f"Не удалось добавить в {title} — задачи сохранены в Dayla"
+            return f"Не удалось добавить в {title}"
         sent += 1
     if sent < len(events):
-        return f"В {title} добавлены первые {sent} из {len(events)} — остальные есть в Dayla"
-    return f"Добавлено в {title}"
+        return f"В {title} добавлены первые {sent} из {len(events)}"
+    return None
+
+
+async def export_new(session: AsyncSession, user: User, calendars: list[str] | None, ids: list[int]) -> str | None:
+    """Send confirmed new tasks to the ticked calendars; the line about it for the reply."""
+    if not ids or not calendars:
+        return None
+    events = list(await session.scalars(select(Event).where(Event.id.in_(ids)).order_by(Event.start_at)))
+    problems, done = [], []
+    for slug in calendars:
+        problem = await export_to(session, user, slug, events)
+        if problem:
+            problems.append(problem)
+        else:
+            done.append(PROVIDERS[slug].title if slug in PROVIDERS else slug)
+    lines = [f"Добавлено в {' и '.join(done)}"] if done else []
+    if problems:
+        lines += problems + ["Задачи сохранены в Dayla"]
+    return ". ".join(lines)
 
 
 async def remove_item(session: AsyncSession, user: User, draft_id: int, index: int) -> dict:
@@ -1006,7 +1019,7 @@ async def confirm_draft(session: AsyncSession, user: User, draft_id: int) -> dic
     draft = await get_draft(session, user, draft_id)
     tz = tasks.local_tz(user)
     items = list(draft.items)
-    target = draft.target
+    calendars = draft.calendars
     await session.delete(draft)
     await session.flush()
     if items and items[0].get("action") == "delete":
@@ -1016,9 +1029,9 @@ async def confirm_draft(session: AsyncSession, user: User, draft_id: int) -> dic
         await session.commit()
         return reply
     changes = [item for item in items if isinstance(item.get("event_id"), int)]
-    # Drafts made before the choice (target NULL) keep the old way: to Google when it is connected
-    firsts, ids = await tasks.create_tasks(session, user, [item for item in items if item not in changes], push_google=target in (None, "google"))
-    exported = await export_new(session, user, target, ids)
+    # Drafts made before the choice (calendars NULL) keep the old way: to Google when it is connected
+    firsts, ids = await tasks.create_tasks(session, user, [item for item in items if item not in changes], push_google=calendars is None or "google" in calendars)
+    exported = await export_new(session, user, calendars, ids)
     changed = await apply_changes(session, user, changes, tz) if changes else []
     counts: dict[str | None, int] = {}
     if any(event.series_id for event in firsts):
