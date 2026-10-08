@@ -231,8 +231,9 @@ async def test_apple_with_app_password(client, user, services):
     assert await titles(client, headers) == ["Ужин с семьёй"]
     assert (await client.post("/api/integrations/apple/sync", headers=headers)).json()["created"] == 0
     reply = (await client.post("/api/assistant/chat", json={"text": "позвонить маме послезавтра"}, headers=headers)).json()
-    event_id = (await client.post(f"/api/assistant/drafts/{reply['draft_id']}/confirm", headers=headers)).json()["event_ids"][0]
-    assert (await client.post(f"/api/integrations/apple/export/{event_id}", headers=headers)).status_code == 201
+    # The chat sends it to the connected calendar on confirm
+    created = (await client.post(f"/api/assistant/drafts/{reply['draft_id']}/confirm", headers=headers)).json()
+    assert created["note"] == "Добавлено в Apple Calendar"
     assert "SUMMARY:Позвонить маме" in services.created["apple"][0]
 
 
@@ -248,3 +249,49 @@ async def test_google_meeting_shared_by_two_users(client, user, services):
     await oauth_connect(client, other, "google")
     assert await titles(client, headers) == ["Стендап в Google"]
     assert await titles(client, other) == ["Стендап в Google"]
+
+
+async def draft(client, headers, text: str) -> dict:
+    reply = (await client.post("/api/assistant/chat", json={"text": text}, headers=headers)).json()
+    assert reply["kind"] == "proposal", reply
+    return reply
+
+
+async def test_draft_offers_the_connected_calendars(client, user, services):
+    headers, _ = user
+    connected = await client.post("/api/integrations/apple/connect", json={"values": {"username": "olga@icloud.com", "app_password": "app-pass"}}, headers=headers)
+    assert connected.status_code == 200, connected.text
+    reply = await draft(client, headers, "позвонить маме послезавтра в 18:00")
+    # A connected calendar is the default: it was connected to get the tasks
+    assert [item["slug"] for item in reply["targets"]] == ["dayla", "apple"] and reply["target"] == "apple"
+    # The draft shows the end its task gets: an hour after the start when none was said
+    item = reply["events"][0]
+    assert item["end_time"] is None and item["end"][11:16] == "19:00"
+
+    chosen = await client.post(f"/api/assistant/drafts/{reply['draft_id']}/target", json={"target": "apple"}, headers=headers)
+    assert chosen.status_code == 200 and chosen.json()["target"] == "apple"
+    assert (await client.post(f"/api/assistant/drafts/{reply['draft_id']}/target", json={"target": "notion"}, headers=headers)).status_code == 422
+    created = (await client.post(f"/api/assistant/drafts/{reply['draft_id']}/confirm", headers=headers)).json()
+    assert created["note"] == "Добавлено в Apple Calendar"
+    assert len(services.created["apple"]) == 1 and "SUMMARY:Позвонить маме" in services.created["apple"][0]
+    links = (await client.get(f"/api/events/{created['event_ids'][0]}/links", headers=headers)).json()
+    assert [link["provider"] for link in links] == ["apple"]
+
+    # The choice is remembered for the next draft, also "Dayla only"
+    reply = await draft(client, headers, "купить хлеб завтра")
+    await client.post(f"/api/assistant/drafts/{reply['draft_id']}/target", json={"target": "dayla"}, headers=headers)
+    assert (await draft(client, headers, "полить цветы завтра"))["target"] == "dayla"
+
+
+async def test_draft_to_google_by_default_or_dayla_only(client, user, services):
+    headers, _ = user
+    await oauth_connect(client, headers, "google")
+    reply = await draft(client, headers, "купить хлеб послезавтра в 18:00")
+    assert reply["target"] == "google"
+    created = (await client.post(f"/api/assistant/drafts/{reply['draft_id']}/confirm", headers=headers)).json()
+    assert created["note"] == "Добавлено в Google Calendar" and services.created["google"] == ["Купить хлеб"]
+
+    reply = await draft(client, headers, "позвонить маме послезавтра в 19:00")
+    await client.post(f"/api/assistant/drafts/{reply['draft_id']}/target", json={"target": "dayla"}, headers=headers)
+    created = (await client.post(f"/api/assistant/drafts/{reply['draft_id']}/confirm", headers=headers)).json()
+    assert created["note"] is None and services.created["google"] == ["Купить хлеб"]

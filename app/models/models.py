@@ -60,6 +60,8 @@ class User(Base):
     telegram_link_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # Onboarding answers: purpose, spheres, goals, tone of voice, work days and hours
     profile: Mapped[dict] = mapped_column(EncryptedJSON("users.profile"), default=dict, server_default="{}")
+    # Where the assistant adds new tasks: "dayla" or a connected calendar ("google", "yandex", ...), the last choice
+    calendar_target: Mapped[str | None] = mapped_column(String(30))
     calendars: Mapped[list["Calendar"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     events: Mapped[list["Event"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     integrations: Mapped[list["Integration"]] = relationship(back_populates="user", cascade="all, delete-orphan")
@@ -283,6 +285,9 @@ class AssistantDraft(Base):
     # {"index": n, "field": "title" | "date" | "time"} while the bot waits for a new value
     # none_as_null: "not waiting" must be SQL NULL — JSON null made every draft look like it waited for an edit
     awaiting: Mapped[dict | None] = mapped_column(JSONB(none_as_null=True))
+    # Where the new tasks go on confirm, and the choices offered: [{"slug", "title"}]; NULL in drafts made before
+    target: Mapped[str | None] = mapped_column(String(30))
+    targets: Mapped[list | None] = mapped_column(JSONB(none_as_null=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 

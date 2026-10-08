@@ -28,6 +28,7 @@ from app.schemas import (
     MoveToDayRequest,
     RatingRequest,
     UndoRequest,
+    DraftTarget,
     DraftUpdate,
     EventCreate,
     EventRead,
@@ -350,6 +351,16 @@ async def assistant_history(limit: int = 60, user: User = Depends(get_current_us
 async def update_draft(draft_id: int, payload: DraftUpdate, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
     try:
         return await chat.replace_items(session, user, draft_id, payload.items)
+    except chat.DraftNotFound:
+        raise HTTPException(status_code=404, detail="Черновик не найден") from None
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from None
+
+
+@router.post("/assistant/drafts/{draft_id}/target")
+async def draft_target(draft_id: int, payload: DraftTarget, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    try:
+        return await chat.set_target(session, user, draft_id, payload.target)
     except chat.DraftNotFound:
         raise HTTPException(status_code=404, detail="Черновик не найден") from None
     except ValueError as error:

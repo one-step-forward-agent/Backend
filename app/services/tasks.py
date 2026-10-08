@@ -122,8 +122,11 @@ def add_occurrences(session: AsyncSession, event: Event, now: datetime) -> list[
     return extra
 
 
-async def create_tasks(session: AsyncSession, user: User, items: list[dict], source: str = "ai") -> tuple[list[Event], list[int]]:
-    """Create events from normalized items (see chat.normalize_item); returns the first event of each item and all ids."""
+async def create_tasks(
+    session: AsyncSession, user: User, items: list[dict], source: str = "ai", push_google: bool = True
+) -> tuple[list[Event], list[int]]:
+    """Create events from normalized items (see chat.normalize_item); returns the first event of each item and all ids.
+    push_google: copy them to a connected Google Calendar (the assistant passes its draft's choice)."""
     tz = local_tz(user)
     calendar = await default_calendar(session, user, str(tz))
     now = datetime.now(tz)
@@ -176,7 +179,8 @@ async def create_tasks(session: AsyncSession, user: User, items: list[dict], sou
     created = [event for group in groups for event in group]
     for event in created:
         await session.refresh(event)
-    await push_new_events_to_google(session, user.id, created)
+    if push_google:
+        await push_new_events_to_google(session, user.id, created)
     return [group[0] for group in groups], [event.id for event in created]
 
 

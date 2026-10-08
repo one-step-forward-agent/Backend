@@ -122,11 +122,12 @@ async def test_connect_imports_and_exports(client, user, fake_yandex):
     assert synced.json()["updated"] == 1 and synced.json()["created"] == 0
     assert (await client.post("/api/integrations/yandex/test", headers=headers)).json() == {"status": "ok", "account": "olga@yandex.ru"}
 
-    # A Dayla task goes to Yandex Calendar
+    # A task from the chat goes to Yandex Calendar: the connected calendar is the default target
     created = await client.post("/api/assistant/chat", json={"text": "купить хлеб послезавтра в 18:00"}, headers=headers)
-    event_ids = (await client.post(f"/api/assistant/drafts/{created.json()['draft_id']}/confirm", headers=headers)).json()["event_ids"]
-    exported = await client.post(f"/api/integrations/yandex/export/{event_ids[0]}", headers=headers)
-    assert exported.status_code == 201, exported.text
+    assert created.json()["target"] == "yandex"
+    confirmed = (await client.post(f"/api/assistant/drafts/{created.json()['draft_id']}/confirm", headers=headers)).json()
+    assert confirmed["note"] == "Добавлено в Яндекс Календарь"
+    assert (await client.post(f"/api/integrations/yandex/export/{confirmed['event_ids'][0]}", headers=headers)).status_code == 409
     assert len(fake_yandex.puts) == 1 and "SUMMARY:Купить хлеб" in fake_yandex.puts[0][1]
 
 
