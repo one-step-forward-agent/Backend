@@ -91,6 +91,8 @@ class Calendar(Base):
 
 class Event(Base):
     __tablename__ = "events"
+    # An id from Google or another service is unique per user: a meeting both users are invited to has one Google id
+    __table_args__ = (UniqueConstraint("user_id", "external_id", name="uq_events_user_external"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     calendar_id: Mapped[int] = mapped_column(ForeignKey("calendars.id", ondelete="CASCADE"), index=True)
@@ -104,7 +106,7 @@ class Event(Base):
     priority: Mapped[str] = mapped_column(String(20), default=Priority.MEDIUM)
     location: Mapped[str | None] = mapped_column(EncryptedText("events.location"))
     source: Mapped[str] = mapped_column(String(20), default=Provider.LOCAL)
-    external_id: Mapped[str | None] = mapped_column(String(255), unique=True)
+    external_id: Mapped[str | None] = mapped_column(String(255))
     sync_status: Mapped[str] = mapped_column(String(20), default=SyncStatus.NOT_SYNCED)
     all_day: Mapped[bool] = mapped_column(Boolean, default=False)
     reminder_minutes: Mapped[int | None] = mapped_column(Integer)

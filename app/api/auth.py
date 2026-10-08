@@ -27,6 +27,16 @@ from app.schemas import LoginRequest, RefreshRequest, RegisterRequest, TokenResp
 
 logger = logging.getLogger(__name__)
 
+
+async def first_sync(session: AsyncSession, user: User, integration: Integration) -> None:
+    """Import events right after connecting: after onboarding nobody presses "Синхронизировать". A failure keeps
+    the connection; the error is shown on the integration and the next sync retries."""
+    try:
+        await integration_service.sync_integration(session, user, integration)
+    except Exception:
+        logger.exception("First %s sync failed for user %s", integration.provider, user.id)
+        await session.rollback()
+
 session_router = APIRouter(prefix="/auth", tags=["auth"])
 google_router = APIRouter(prefix="/auth/google", tags=["auth"])
 yandex_router = APIRouter(prefix="/auth/yandex", tags=["auth"])
@@ -394,6 +404,7 @@ async def google_callback(
     if not google_calendar:
         session.add(Calendar(user_id=user_id, integration_id=integration.id, name="Google Calendar", provider="google", external_id="primary", timezone="UTC"))
     await session.commit()
+    await first_sync(session, user, integration)
     if return_to:
         separator = "&" if "?" in return_to else "?"
         return RedirectResponse(url=f"{return_to}{separator}connected=google", status_code=303)
@@ -487,13 +498,7 @@ async def yandex_callback(
     store_secrets(integration, tokens)
     await session.commit()
 
-    # Import events right away: after onboarding nobody presses "Синхронизировать". A failure keeps the
-    # connection; the error is shown on the integration and the next sync retries.
-    try:
-        await integration_service.sync_integration(session, user, integration)
-    except Exception:
-        logger.exception("First Yandex Calendar sync failed for user %s", user_id)
-        await session.rollback()
+    await first_sync(session, user, integration)
 
     if return_to:
         separator = "&" if "?" in return_to else "?"
@@ -605,23 +610,9 @@ async def notion_callback(
         tokens["refresh_token"] = token_data["refresh_token"]
     store_secrets(integration, tokens)
 
-    await session.flush()
-
-    # 5. Календарь-плейсхолдер.
-    notion_calendar = await session.scalar(
-        select(Calendar).where(Calendar.user_id == user_id, Calendar.provider == "notion")
-    )
-    if not notion_calendar:
-        session.add(Calendar(
-            user_id=user_id,
-            integration_id=integration.id,
-            name="Notion",
-            provider="notion",
-            external_id=profile.get("id", "notion-workspace"),
-            timezone="UTC",
-        ))
-
     await session.commit()
+    # 5. Календарь "primary" создаёт синхронизация — сразу импортируем записи выбранных баз.
+    await first_sync(session, user, integration)
 
     if return_to:
         separator = "&" if "?" in return_to else "?"
@@ -738,22 +729,9 @@ async def jira_callback(
         "site_name": site_name,
     }
 
-    await session.flush()
-
-    jira_calendar = await session.scalar(
-        select(Calendar).where(Calendar.user_id == user_id, Calendar.provider == "jira")
-    )
-    if not jira_calendar:
-        session.add(Calendar(
-            user_id=user_id,
-            integration_id=integration.id,
-            name=site_name,
-            provider="jira",
-            external_id=cloud_id,
-            timezone="UTC",
-        ))
-
     await session.commit()
+    # Календарь "primary" создаёт синхронизация — сразу импортируем задачи со сроком.
+    await first_sync(session, user, integration)
 
     if return_to:
         separator = "&" if "?" in return_to else "?"

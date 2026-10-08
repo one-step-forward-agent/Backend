@@ -111,10 +111,7 @@ async def sync_integration(session: AsyncSession, user: User, integration: Integ
             continue
         external_id = f"{integration.provider}:{integration.id}:{item.external_id}" if provider.scoped_external_ids else item.external_id
         external_id = external_id[:255]
-        event = await session.scalar(select(Event).where(Event.external_id == external_id))
-        if event and event.user_id != user.id:
-            skipped += 1
-            continue
+        event = await session.scalar(select(Event).where(Event.user_id == user.id, Event.external_id == external_id))
         if not event:
             event = Event(calendar_id=calendar.id, user_id=user.id, external_id=external_id, source=integration.provider)
             session.add(event)
