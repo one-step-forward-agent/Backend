@@ -34,6 +34,10 @@ EVENTS_QUERY = """<?xml version="1.0" encoding="utf-8"?>
 </c:calendar-query>"""
 
 
+class CalDAVUnauthorized(IntegrationError):
+    pass
+
+
 def _caldav_time(value: datetime) -> str:
     return value.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
@@ -48,6 +52,10 @@ class AppleCalendarIntegration(IntegrationProvider):
         ConfigField("calendar_name", "Календарь для экспорта", required=False, placeholder="Пусто — первый доступный"),
         ConfigField("server_url", "CalDAV сервер", type="url", required=False, default="https://caldav.icloud.com/", help="Можно указать любой CalDAV-сервер"),
     ]
+    auth_error = "Неверный Apple ID или пароль приложения"
+
+    def _server(self) -> str:
+        return self.config.get("server_url") or "https://caldav.icloud.com/"
 
     def _client(self) -> httpx.AsyncClient:
         return guarded_client(
@@ -63,15 +71,14 @@ class AppleCalendarIntegration(IntegrationProvider):
         except (httpx.HTTPError, httpx.InvalidURL) as error:
             raise IntegrationError("CalDAV сервер недоступен") from error
         if response.status_code == 401:
-            raise IntegrationError("Неверный Apple ID или пароль приложения")
+            raise CalDAVUnauthorized(self.auth_error)
         if response.status_code != 207:
             raise IntegrationError(f"CalDAV сервер ответил {response.status_code}")
         # The CalDAV server is user-supplied: parse its XML without entity expansion or external entities
         return str(response.url), SafeElementTree.fromstring(response.content)
 
     async def _calendars(self, client: httpx.AsyncClient) -> list[tuple[str, str]]:
-        base = self.config.get("server_url") or "https://caldav.icloud.com/"
-        url, tree = await self._multistatus(client, "PROPFIND", base, PRINCIPAL_QUERY, "0")
+        url, tree = await self._multistatus(client, "PROPFIND", self._server(), PRINCIPAL_QUERY, "0")
         principal = tree.find(".//d:current-user-principal/d:href", NS)
         if principal is None or not principal.text:
             raise IntegrationError("CalDAV сервер не вернул principal")

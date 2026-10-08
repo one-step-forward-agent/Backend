@@ -72,6 +72,8 @@ Copy `.env.example` to `.env` and fill in the values:
 | `DEFAULT_TIMEZONE` | Fallback user timezone (default `Europe/Moscow`) |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | Google OAuth client |
 | `GOOGLE_REDIRECT_URI` | OAuth callback, must end with `/auth/google/callback` |
+| `YANDEX_CLIENT_ID`, `YANDEX_CLIENT_SECRET` | Yandex ID OAuth app (oauth.yandex.ru) with the «Яндекс Календарь: calendar:all» permission |
+| `YANDEX_REDIRECT_URI` | OAuth callback, must end with `/auth/yandex/callback` and match the app's Redirect URI |
 | `SBER_AUTHORIZATION_KEY` | GigaChat authorization key |
 | `SBER_SCOPE` | GigaChat scope (default `GIGACHAT_API_PERS`) |
 | `GIGACHAT_MODEL` | GigaChat model name (default `GigaChat`) |

@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
 import json
+import logging
 from urllib.parse import quote, urlencode
 
 import httpx
@@ -20,8 +21,11 @@ from app.core.config import settings
 from app.core.database import get_session
 from app.core.dataenc import email_lookup
 from app.models.models import Calendar, Integration, RefreshToken, User
+from app.services.integrations import service as integration_service
 from app.services.integrations.service import integration_secrets, store_secrets
 from app.schemas import LoginRequest, RefreshRequest, RegisterRequest, TokenResponse
+
+logger = logging.getLogger(__name__)
 
 session_router = APIRouter(prefix="/auth", tags=["auth"])
 google_router = APIRouter(prefix="/auth/google", tags=["auth"])
@@ -471,30 +475,25 @@ async def yandex_callback(
         for key, value in values.items():
             setattr(integration, key, value)
     else:
-        integration = Integration(config={}, **values)
+        integration = Integration(**values)
         session.add(integration)
+    # The login names the account in the list of integrations; CalDAV itself works with the token
+    integration.config = {"login": email}
 
     tokens = {"access_token": token_data["access_token"]}
-    if token_data.get("refresh_token"):
-        tokens["refresh_token"] = token_data["refresh_token"]
+    refresh_token = token_data.get("refresh_token") or integration_secrets(integration).get("refresh_token")
+    if refresh_token:
+        tokens["refresh_token"] = refresh_token
     store_secrets(integration, tokens)
-
-    await session.flush()
-
-    yandex_calendar = await session.scalar(
-        select(Calendar).where(Calendar.user_id == user_id, Calendar.provider == "yandex")
-    )
-    if not yandex_calendar:
-        session.add(Calendar(
-            user_id=user_id,
-            integration_id=integration.id,
-            name="Yandex Calendar",
-            provider="yandex",
-            external_id="placeholder",
-            timezone="UTC",
-        ))
-
     await session.commit()
+
+    # Import events right away: after onboarding nobody presses "Синхронизировать". A failure keeps the
+    # connection; the error is shown on the integration and the next sync retries.
+    try:
+        await integration_service.sync_integration(session, user, integration)
+    except Exception:
+        logger.exception("First Yandex Calendar sync failed for user %s", user_id)
+        await session.rollback()
 
     if return_to:
         separator = "&" if "?" in return_to else "?"
