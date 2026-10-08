@@ -50,6 +50,21 @@ class LoginRequest(Credentials):
     pass
 
 
+class OAuthStart(BaseModel):
+    """Sign up or log in through Google or Yandex. Signing up also connects the calendar."""
+
+    mode: Literal["signup", "login"]
+    return_to: str | None = Field(default=None, max_length=300)
+    timezone: str | None = None
+    # Personal data consent and the terms of use, as the checkboxes of the registration form
+    consent: bool = False
+
+    @field_validator("timezone")
+    @classmethod
+    def check_timezone(cls, value: str | None) -> str | None:
+        return _timezone(value)
+
+
 class RefreshRequest(BaseModel):
     refresh_token: str | None = None
 

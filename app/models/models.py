@@ -71,6 +71,20 @@ class User(Base):
         return value
 
 
+class UserIdentity(Base):
+    """A Google or Yandex account the user signs in with: the provider's stable account id, not the email,
+    so a changed email still finds the user and someone else's account with the same email does not."""
+
+    __tablename__ = "user_identities"
+    __table_args__ = (UniqueConstraint("provider", "subject", name="uq_user_identities_provider_subject"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    provider: Mapped[str] = mapped_column(String(30))
+    subject: Mapped[str] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class Calendar(Base):
     __tablename__ = "calendars"
     __table_args__ = (UniqueConstraint("integration_id", "external_id", name="uq_calendars_integration_external"),)

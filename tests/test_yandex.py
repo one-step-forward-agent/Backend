@@ -1,6 +1,7 @@
 """Yandex Calendar: OAuth through Yandex ID, then CalDAV with the OAuth token — against a fake Yandex."""
 
 import dataclasses
+import uuid
 from datetime import datetime, time, timedelta
 from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
@@ -91,7 +92,7 @@ async def connect(client, headers, fake_yandex) -> httpx.Response:
     assert started.status_code == 200, started.text
     url = urlparse(started.json()["authorization_url"])
     query = parse_qs(url.query)
-    assert url.netloc == "oauth.yandex.ru" and query["scope"] == ["calendar:all"]
+    assert url.netloc == "oauth.yandex.ru" and query["scope"] == ["calendar:all login:email"]
     # Yandex sends the browser back with the Dayla session cookie
     client.cookies.set(ACCESS_COOKIE, headers["Authorization"].split()[1])
     return await client.get("/auth/yandex/callback", params={"code": "code-1", "state": query["state"][0]})
@@ -164,3 +165,21 @@ async def test_expired_token_is_refreshed(client, user, fake_yandex):
     # The new token is stored: the next sync works without refreshing
     assert (await client.post("/api/integrations/yandex/sync", headers=headers)).status_code == 200
     assert refreshed == ["refresh_token"]
+
+
+async def test_sign_up_with_yandex(fake_yandex):
+    from app.main import app
+
+    fake_yandex.profile = {"id": f"y-{uuid.uuid4().hex}", "default_email": f"new-{uuid.uuid4().hex[:10]}@yandex.ru"}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as browser:
+        started = await browser.post("/auth/oauth/yandex/start", json={"mode": "signup", "consent": True, "return_to": "/onboarding/integrations"})
+        query = parse_qs(urlparse(started.json()["authorization_url"]).query)
+        assert query["scope"] == ["calendar:all login:email"]
+        callback = await browser.get("/auth/yandex/callback", params={"code": "code-1", "state": query["state"][0]})
+        assert callback.status_code == 303 and callback.headers["location"] == "/onboarding/integrations?connected=yandex"
+        token = next(value.split("=", 1)[1].split(";")[0] for value in callback.headers.get_list("set-cookie") if value.startswith(f"{ACCESS_COOKIE}="))
+        headers = {"Authorization": f"Bearer {token}"}
+        assert (await browser.get("/api/me", headers=headers)).json()["email"] == fake_yandex.profile["default_email"]
+        start = datetime.combine(datetime.now(TZ).date(), time.min, TZ)
+        events = (await browser.get("/api/events", params={"start": start.isoformat(), "limit": 100}, headers=headers)).json()
+        assert [event["title"] for event in events] == ["Планёрка в Яндексе"]

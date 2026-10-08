@@ -26,6 +26,7 @@ class FakeServices:
         self.calls: list[tuple[str, str]] = []
         self.created: dict[str, list] = {"google": [], "notion": [], "apple": []}
         self.atlassian_profile = True
+        self.google_profile = {"sub": "g-olga", "email": "olga@gmail.com", "email_verified": True, "name": "Ольга"}
         self.jira_token = "j-1"
 
     def handle(self, request: httpx.Request) -> httpx.Response:
@@ -36,7 +37,7 @@ class FakeServices:
         if url == "https://oauth2.googleapis.com/token":
             return httpx.Response(200, json={"access_token": "g-1", "refresh_token": "g-r", "expires_in": 3600})
         if url == "https://openidconnect.googleapis.com/v1/userinfo":
-            return httpx.Response(200, json={"email": "olga@gmail.com"})
+            return httpx.Response(200, json=self.google_profile)
         if url == "https://www.googleapis.com/calendar/v3/users/me/calendarList":
             return httpx.Response(200, json={"items": [{"id": "olga@gmail.com", "primary": True}]})
         if url == "https://www.googleapis.com/calendar/v3/calendars/primary/events":

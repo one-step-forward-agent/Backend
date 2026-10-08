@@ -20,10 +20,10 @@ from app.core.auth import create_access_token, decode_access_token, create_refre
 from app.core.config import settings
 from app.core.database import get_session
 from app.core.dataenc import email_lookup
-from app.models.models import Calendar, Integration, RefreshToken, User
+from app.models.models import Calendar, Integration, RefreshToken, User, UserIdentity
 from app.services.integrations import service as integration_service
 from app.services.integrations.service import integration_secrets, store_secrets
-from app.schemas import LoginRequest, RefreshRequest, RegisterRequest, TokenResponse
+from app.schemas import LoginRequest, OAuthStart, RefreshRequest, RegisterRequest, TokenResponse
 
 logger = logging.getLogger(__name__)
 
@@ -54,29 +54,36 @@ REGISTER_MAX_PER_IP = 10
 REFRESH_REUSE_GRACE = timedelta(seconds=30)
 
 
-async def _token_response(session: AsyncSession, user_id: int, cookies: bool = True) -> JSONResponse:
+async def _issue_tokens(session: AsyncSession, user_id: int) -> TokenResponse:
     now = datetime.now(timezone.utc)
     await session.execute(delete(RefreshToken).where(RefreshToken.user_id == user_id, RefreshToken.expires_at < now))
     access_token = create_access_token(user_id)
     refresh_token, jti, expires_at = create_refresh_token(user_id)
     session.add(RefreshToken(jti=jti, user_id=user_id, expires_at=expires_at))
     await session.commit()
-    body = TokenResponse(access_token=access_token, refresh_token=refresh_token, expires_in=settings.jwt_expire_minutes * 60)
-    response = JSONResponse(body.model_dump())
-    if not cookies:
-        return response
+    return TokenResponse(access_token=access_token, refresh_token=refresh_token, expires_in=settings.jwt_expire_minutes * 60)
+
+
+def _set_session_cookies(response, tokens: TokenResponse) -> None:
     response.set_cookie(
-        ACCESS_COOKIE, access_token, httponly=True, samesite="lax", secure=settings.cookie_secure, max_age=settings.jwt_expire_minutes * 60
+        ACCESS_COOKIE, tokens.access_token, httponly=True, samesite="lax", secure=settings.cookie_secure, max_age=settings.jwt_expire_minutes * 60
     )
     response.set_cookie(
         REFRESH_COOKIE,
-        refresh_token,
+        tokens.refresh_token,
         httponly=True,
         samesite="strict",
         secure=settings.cookie_secure,
         max_age=settings.jwt_refresh_expire_days * 86400,
         path="/auth",
     )
+
+
+async def _token_response(session: AsyncSession, user_id: int, cookies: bool = True) -> JSONResponse:
+    tokens = await _issue_tokens(session, user_id)
+    response = JSONResponse(tokens.model_dump())
+    if cookies:
+        _set_session_cookies(response, tokens)
     return response
 
 
@@ -210,8 +217,13 @@ def safe_return_path(path: str | None) -> str | None:
     return path
 
 
-def _oauth_state(user_id: int, return_to: str | None = None) -> str:
+def _oauth_state(user_id: int, return_to: str | None = None, mode: str = "connect", tz: str | None = None) -> str:
+    """user_id is 0 when signing up or logging in: the callback finds or creates the user."""
     data = {"user_id": user_id, "expires": int(datetime.now(timezone.utc).timestamp()) + 600}
+    if mode != "connect":
+        data["mode"] = mode
+    if tz:
+        data["tz"] = tz
     if safe_return_path(return_to):
         data["return_to"] = return_to
     payload = urlsafe_b64encode(json.dumps(data).encode()).decode()
@@ -220,6 +232,12 @@ def _oauth_state(user_id: int, return_to: str | None = None) -> str:
 
 
 def _validate_oauth_state(state: str) -> tuple[int, str | None]:
+    data = _state_data(state)
+    return data["user_id"], data["return_to"]
+
+
+def _state_data(state: str) -> dict:
+    """The signed state: user_id, return_to, mode and tz."""
     try:
         payload, signature = state.split(".", 1)
         expected = hmac.new(settings.secret_key.encode(), payload.encode(), hashlib.sha256).hexdigest()
@@ -228,38 +246,45 @@ def _validate_oauth_state(state: str) -> tuple[int, str | None]:
         data = json.loads(urlsafe_b64decode(payload.encode()))
         if int(data["expires"]) < int(datetime.now(timezone.utc).timestamp()):
             raise ValueError
-        return int(data["user_id"]), safe_return_path(data.get("return_to"))
+        mode = data.get("mode", "connect")
+        if mode not in ("connect", "signup", "login"):
+            raise ValueError
+        return {"user_id": int(data["user_id"]), "return_to": safe_return_path(data.get("return_to")), "mode": mode, "tz": data.get("tz")}
     except (ValueError, KeyError, TypeError, json.JSONDecodeError):
         raise HTTPException(status_code=400, detail="Invalid or expired OAuth state") from None
 
 
-def google_authorization_url(user_id: int, return_to: str | None = None) -> str:
+def google_authorization_url(user_id: int, return_to: str | None = None, mode: str = "connect", tz: str | None = None) -> str:
     if not settings.google_client_id:
         raise HTTPException(status_code=503, detail="Google OAuth is not configured")
-    query = urlencode(
-        {
-            "client_id": settings.google_client_id,
-            "redirect_uri": settings.google_redirect_uri,
-            "response_type": "code",
-            "scope": "openid email profile https://www.googleapis.com/auth/calendar",
-            "access_type": "offline",
-            "prompt": "select_account consent",
-            "state": _oauth_state(user_id, return_to),
-        }
-    )
+    params = {
+        "client_id": settings.google_client_id,
+        "redirect_uri": settings.google_redirect_uri,
+        "response_type": "code",
+        "scope": "openid email profile https://www.googleapis.com/auth/calendar",
+        "access_type": "offline",
+        "prompt": "select_account consent",
+        "state": _oauth_state(user_id, return_to, mode, tz),
+    }
+    if mode == "login":
+        # Logging in asks only for the account, not for the calendar
+        params.update(scope="openid email profile", prompt="select_account")
+        del params["access_type"]
+    query = urlencode(params)
     return f"https://accounts.google.com/o/oauth2/v2/auth?{query}"
 
-def yandex_authorization_url(user_id: int, return_to: str | None = None) -> str:
+def yandex_authorization_url(user_id: int, return_to: str | None = None, mode: str = "connect", tz: str | None = None) -> str:
     """Формирует ссылку на страницу авторизации Яндекс ID."""
     if not settings.yandex_client_id:
         raise HTTPException(status_code=503, detail="Yandex OAuth is not configured")
+    # login:email gives the email an account is created with; logging in asks only for it
     query = urlencode(
         {
             "client_id": settings.yandex_client_id,
             "redirect_uri": settings.yandex_redirect_uri,
             "response_type": "code",
-            "scope": "calendar:all",
-            "state": _oauth_state(user_id, return_to),
+            "scope": "login:email" if mode == "login" else "calendar:all login:email",
+            "state": _oauth_state(user_id, return_to, mode, tz),
         }
     )
     return f"https://oauth.yandex.ru/authorize?{query}"
@@ -322,6 +347,113 @@ async def jira_login(user: User = Depends(get_current_user)):
     return {"authorization_url": jira_authorization_url(user.id)}
 
 
+SIGN_IN_URLS = {"google": google_authorization_url, "yandex": yandex_authorization_url}
+SIGN_IN_TITLES = {"google": "Google", "yandex": "Яндекс"}
+OAUTH_START_MAX_PER_IP = 60
+
+
+@session_router.post("/oauth/{provider}/start")
+async def oauth_start(provider: str, payload: OAuthStart, request: Request):
+    """Sign up or log in through Google or Yandex: a link to the provider; the callback creates or finds the user."""
+    builder = SIGN_IN_URLS.get(provider)
+    if not builder:
+        raise HTTPException(status_code=404, detail="Вход через этот сервис недоступен")
+    if payload.mode == "signup" and not payload.consent:
+        raise HTTPException(status_code=400, detail="Для регистрации примите пользовательское соглашение и дайте согласие на обработку персональных данных")
+    ratelimit.hit(f"oauth-start:{ratelimit.client_ip(request)}", OAUTH_START_MAX_PER_IP, REGISTER_WINDOW_SECONDS, "Слишком много попыток, попробуйте позже")
+    return {"authorization_url": builder(0, payload.return_to, payload.mode, payload.timezone)}
+
+
+class SignInRefused(Exception):
+    """The callback cannot sign the user in: back to a page of the site with the reason."""
+
+    def __init__(self, message: str, path: str, return_to: str | None):
+        self.message, self.path, self.return_to = message, path, return_to
+
+    def redirect(self) -> RedirectResponse:
+        query = {"error": self.message}
+        if self.return_to:
+            query["next"] = self.return_to
+        return RedirectResponse(url=f"{self.path}?{urlencode(query)}", status_code=303)
+
+
+def _callback_entry(state: str, access_cookie: str | None, title: str) -> dict | RedirectResponse:
+    """The state of a callback. Connecting links the provider only to the Dayla account logged in in this browser:
+    otherwise an attacker could send a victim their own authorization link and receive the victim's calendar."""
+    entry = _state_data(state)
+    if entry["mode"] != "connect":
+        return entry
+    try:
+        session_user_id = decode_access_token(access_cookie or "")
+    except (jwt.InvalidTokenError, ValueError):
+        session_user_id = None
+    if session_user_id is None:
+        next_path = entry["return_to"] or "/app/integrations"
+        return RedirectResponse(url=f"/login?next={quote(next_path, safe='/')}", status_code=303)
+    if session_user_id != entry["user_id"]:
+        raise HTTPException(status_code=403, detail=f"Ссылка подключения {title} создана для другого аккаунта Dayla")
+    return entry
+
+
+async def _link_identity(session: AsyncSession, provider: str, subject: str | None, user_id: int) -> None:
+    if subject and not await session.scalar(select(UserIdentity.id).where(UserIdentity.provider == provider, UserIdentity.subject == subject)):
+        session.add(UserIdentity(user_id=user_id, provider=provider, subject=subject))
+
+
+async def _callback_user(session: AsyncSession, entry: dict, provider: str, subject: str | None, email: str | None, name: str | None) -> User:
+    """The Dayla user of a callback. Connecting: the logged-in user. Logging in: the user this provider account
+    signed in before, or whose email it is. Signing up: the same, or a new account with the provider's email.
+    `email` is passed only when the provider has verified it."""
+    if entry["mode"] == "connect":
+        user = await session.get(User, entry["user_id"])
+        if not user:
+            raise HTTPException(status_code=401, detail="Пользователь Dayla не найден")
+        # Connected once, the account also logs in
+        await _link_identity(session, provider, subject, user.id)
+        return user
+    title, return_to = SIGN_IN_TITLES[provider], entry["return_to"]
+    if not subject:
+        raise SignInRefused(f"{title} не сообщил данные аккаунта. Попробуйте ещё раз.", "/login", return_to)
+    identity = await session.scalar(select(UserIdentity).where(UserIdentity.provider == provider, UserIdentity.subject == subject))
+    if identity:
+        user = await session.get(User, identity.user_id)
+        if not user or not user.is_active:
+            raise SignInRefused("Аккаунт отключён.", "/login", None)
+        return user
+    if not email:
+        raise SignInRefused(f"{title} не сообщил подтверждённый email. Зарегистрируйтесь по email.", "/register", return_to)
+    existing = await session.scalar(select(User).where(User.email_hash.in_(email_lookup(email))))
+    if existing:
+        # Not logged in by email alone: whoever controls a provider account with this email would get the Dayla account
+        if entry["mode"] == "signup":
+            message = f"Аккаунт {email} уже есть. Войдите в него — и сервис подключится."
+        else:
+            message = f"Аккаунт {email} создан с паролем. Войдите по паролю — потом вход через {title} тоже заработает."
+        raise SignInRefused(message, "/login", return_to)
+    if entry["mode"] == "login":
+        raise SignInRefused(f"Аккаунта {email} ещё нет. Зарегистрируйтесь — это займёт минуту.", "/register", None)
+    user = User(email=email, name=(name or "").strip()[:200] or None, timezone=entry["tz"] or settings.default_timezone, is_active=True)
+    session.add(user)
+    await session.flush()
+    session.add(UserIdentity(user_id=user.id, provider=provider, subject=subject))
+    return user
+
+
+async def _finish_callback(session: AsyncSession, entry: dict, user_id: int, provider: str) -> RedirectResponse:
+    """The redirect back to the site; signing up or logging in also starts the Dayla session."""
+    return_to = entry["return_to"]
+    if entry["mode"] == "login":
+        response = RedirectResponse(url=return_to or "/app", status_code=303)
+    elif return_to:
+        separator = "&" if "?" in return_to else "?"
+        response = RedirectResponse(url=f"{return_to}{separator}connected={provider}", status_code=303)
+    else:
+        response = RedirectResponse(url=f"/?connected={provider}", status_code=303)
+    if entry["mode"] != "connect":
+        _set_session_cookies(response, await _issue_tokens(session, user_id))
+    return response
+
+
 @google_router.get("/callback")
 async def google_callback(
     code: str | None = None,
@@ -336,19 +468,9 @@ async def google_callback(
         raise HTTPException(status_code=400, detail="Missing OAuth authorization code")
     if not settings.google_client_id or not settings.google_client_secret:
         raise HTTPException(status_code=503, detail="Google OAuth is not configured")
-    user_id, return_to = _validate_oauth_state(state)
-    # The Google account is linked only to the Dayla account that is logged in in this browser.
-    # Otherwise an attacker could send a victim their own authorization link and receive the
-    # victim's calendar in the attacker's account.
-    try:
-        session_user_id = decode_access_token(access_cookie or "")
-    except (jwt.InvalidTokenError, ValueError):
-        session_user_id = None
-    if session_user_id is None:
-        next_path = return_to or "/app/integrations"
-        return RedirectResponse(url=f"/login?next={quote(next_path, safe='/')}", status_code=303)
-    if session_user_id != user_id:
-        raise HTTPException(status_code=403, detail="Ссылка подключения Google создана для другого аккаунта Dayla")
+    entry = _callback_entry(state, access_cookie, "Google")
+    if isinstance(entry, RedirectResponse):
+        return entry
     async with httpx.AsyncClient(timeout=15) as client:
         response = await client.post(
             "https://oauth2.googleapis.com/token",
@@ -371,9 +493,16 @@ async def google_callback(
     if profile_response.is_error or not profile_response.json().get("email"):
         raise HTTPException(status_code=400, detail="Google account email was not returned")
     profile = profile_response.json()
-    user = await session.get(User, user_id)
-    if not user:
-        raise HTTPException(status_code=401, detail="Пользователь Dayla не найден")
+    verified_email = profile["email"] if profile.get("email_verified") is True else None
+    try:
+        user = await _callback_user(session, entry, "google", profile.get("sub"), verified_email, profile.get("name"))
+    except SignInRefused as refused:
+        await session.rollback()
+        return refused.redirect()
+    user_id = user.id
+    if entry["mode"] == "login":
+        await session.commit()
+        return await _finish_callback(session, entry, user_id, "google")
     integration = await session.scalar(
         select(Integration).where(Integration.user_id == user_id, Integration.provider == "google")
     )
@@ -405,10 +534,7 @@ async def google_callback(
         session.add(Calendar(user_id=user_id, integration_id=integration.id, name="Google Calendar", provider="google", external_id="primary", timezone="UTC"))
     await session.commit()
     await first_sync(session, user, integration)
-    if return_to:
-        separator = "&" if "?" in return_to else "?"
-        return RedirectResponse(url=f"{return_to}{separator}connected=google", status_code=303)
-    return RedirectResponse(url="/?connected=google", status_code=303)
+    return await _finish_callback(session, entry, user_id, "google")
 
 
 @yandex_router.get("/callback")
@@ -425,17 +551,9 @@ async def yandex_callback(
         raise HTTPException(status_code=400, detail="Missing OAuth authorization code")
     if not settings.yandex_client_id or not settings.yandex_client_secret:
         raise HTTPException(status_code=503, detail="Yandex OAuth is not configured")
-
-    user_id, return_to = _validate_oauth_state(state)
-    try:
-        session_user_id = decode_access_token(access_cookie or "")
-    except (jwt.InvalidTokenError, ValueError):
-        session_user_id = None
-    if session_user_id is None:
-        next_path = return_to or "/app/integrations"
-        return RedirectResponse(url=f"/login?next={quote(next_path, safe='/')}", status_code=303)
-    if session_user_id != user_id:
-        raise HTTPException(status_code=403, detail="Ссылка подключения Яндекс создана для другого аккаунта Dayla")
+    entry = _callback_entry(state, access_cookie, "Яндекс")
+    if isinstance(entry, RedirectResponse):
+        return entry
 
     async with httpx.AsyncClient(timeout=15) as client:
         token_response = await client.post(
@@ -459,14 +577,21 @@ async def yandex_callback(
             headers={"Authorization": f"OAuth {token_data['access_token']}"},
             params={"format": "json"},
         )
-    # The email only labels the account: with the scope calendar:all alone Yandex returns no email
-    # (and no login without login:info), so the connection does not depend on it
+    # Yandex always returns the account id; the email needs the scope login:email (Yandex ID confirms its addresses)
     profile = {} if profile_response.is_error else profile_response.json()
-    email = profile.get("default_email") or (profile.get("emails") or [None])[0] or profile.get("login")
-
-    user = await session.get(User, user_id)
-    if not user:
-        raise HTTPException(status_code=401, detail="Пользователь Dayla не найден")
+    yandex_email = profile.get("default_email") or (profile.get("emails") or [None])[0]
+    subject = str(profile["id"]) if profile.get("id") else None
+    try:
+        user = await _callback_user(session, entry, "yandex", subject, yandex_email, profile.get("real_name") or profile.get("display_name"))
+    except SignInRefused as refused:
+        await session.rollback()
+        return refused.redirect()
+    user_id = user.id
+    if entry["mode"] == "login":
+        await session.commit()
+        return await _finish_callback(session, entry, user_id, "yandex")
+    # The email only labels the account: the connection does not depend on it
+    email = yandex_email or profile.get("login")
 
     integration = await session.scalar(
         select(Integration).where(Integration.user_id == user_id, Integration.provider == "yandex")
@@ -497,11 +622,7 @@ async def yandex_callback(
     await session.commit()
 
     await first_sync(session, user, integration)
-
-    if return_to:
-        separator = "&" if "?" in return_to else "?"
-        return RedirectResponse(url=f"{return_to}{separator}connected=yandex", status_code=303)
-    return RedirectResponse(url="/?connected=yandex", status_code=303)
+    return await _finish_callback(session, entry, user_id, "yandex")
 
 
 @notion_router.get("/callback")

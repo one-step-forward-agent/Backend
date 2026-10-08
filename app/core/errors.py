@@ -44,12 +44,13 @@ def _bot(request: Request) -> bool:
 
 def _connect_failed(request: Request, cancelled: bool = False) -> RedirectResponse:
     """An OAuth callback opens in the browser: instead of a JSON page, back to the screen the user came from."""
-    from app.api.auth import _validate_oauth_state
+    from app.api.auth import _state_data
 
     target = "/app/integrations"
     try:
-        _, return_to = _validate_oauth_state(request.query_params.get("state") or "")
-        target = return_to or target
+        state = _state_data(request.query_params.get("state") or "")
+        # A failed login through Google or Yandex has no session to show the error in the app
+        target = "/login" if state["mode"] == "login" else state["return_to"] or target
     except Exception:
         pass
     separator = "&" if "?" in target else "?"
