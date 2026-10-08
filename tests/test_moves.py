@@ -180,3 +180,57 @@ async def test_token_usage_is_recorded(user, client):
     assert (row.purpose, row.model, row.prompt_tokens, row.completion_tokens, row.total_tokens, row.precached_prompt_tokens, row.duration_ms) == (
         "chat_reply", "GigaChat-2", 120, 30, 150, 100, 840
     )
+
+
+async def test_move_buttons_in_the_web_chat(client, user):
+    headers, _ = user
+    tomorrow, after = today() + timedelta(days=1), today() + timedelta(days=2)
+    [event_id] = await add(client, headers, "созвон с Олегом завтра в 10:00")
+
+    moved = (await client.post(f"/api/assistant/events/{event_id}/move", json={"date": after.isoformat()}, headers=headers)).json()
+    assert moved["kind"] == "updated" and moved["text"].startswith("Перенесла «Созвон с Олегом» на")
+    assert moved["events"][0]["date"] == after.isoformat() and moved["events"][0]["time"] == "10:00"
+    assert moved["moved"]["from"] == tomorrow.isoformat() and moved["message_id"]
+    # The move is part of the conversation: "их" means this task now
+    history = (await client.get("/api/assistant/history", headers=headers)).json()
+    assert history[-1]["reply"]["kind"] == "updated"
+
+    same = (await client.post(f"/api/assistant/events/{event_id}/move", json={"date": after.isoformat()}, headers=headers)).json()
+    assert same == {"kind": "answer", "text": f"«Созвон с Олегом» уже стоит на {chat_service.short_day(after)}."}
+    back = (await client.post(f"/api/assistant/events/{event_id}/move", json={"date": moved["moved"]["from"]}, headers=headers)).json()
+    assert back["events"][0]["date"] == tomorrow.isoformat()
+
+
+async def test_cannot_move_someone_elses_task(client, user):
+    headers, _ = user
+    [event_id] = await add(client, headers, "купить хлеб завтра")
+    import uuid
+
+    other = await client.post("/auth/register", json={"email": f"o-{uuid.uuid4().hex[:8]}@example.com", "password": "password-123", "timezone": "Europe/Moscow"})
+    stranger = {"Authorization": f"Bearer {other.json()['access_token']}"}
+    response = await client.post(f"/api/assistant/events/{event_id}/move", json={"date": today().isoformat()}, headers=stranger)
+    assert response.status_code == 404
+
+
+async def test_bot_move_with_buttons_and_a_typed_date(client, user):
+    from tests.conftest import BOT_HEADERS
+
+    headers, chat_id = user
+    [event_id] = await add(client, headers, "забрать посылку завтра")
+    shown = (await client.get(f"/internal/bot/chat/{chat_id}/events/{event_id}", headers=BOT_HEADERS)).json()
+    assert shown["title"] == "Забрать посылку"
+
+    after = today() + timedelta(days=2)
+    moved = await client.post(f"/internal/bot/chat/{chat_id}/events/{event_id}/move", json={"date": after.isoformat()}, headers=BOT_HEADERS)
+    assert moved.status_code == 200 and moved.json()["events"][0]["date"] == after.isoformat()
+
+    # "✍️ Написать дату": the next message is the new day, shown for confirmation
+    prompt = (await client.post(f"/internal/bot/chat/{chat_id}/events/{event_id}/move-date", headers=BOT_HEADERS)).json()
+    assert prompt["field"] == "date" and prompt["draft_id"]
+    target = today() + timedelta(days=10)
+    reply = (await client.post(f"/internal/bot/chat/{chat_id}", json={"text": f"{target.day}.{target.month:02d}"}, headers=BOT_HEADERS)).json()
+    assert reply["kind"] == "proposal" and reply["events"][0]["event_id"] == event_id and reply["events"][0]["date"] == target.isoformat()
+    await client.post(f"/internal/bot/chat/{chat_id}/drafts/{reply['draft_id']}/confirm", headers=BOT_HEADERS)
+    assert (await days_of(client, headers)) == {"Забрать посылку": target.isoformat()}
+    gone = await client.post(f"/internal/bot/chat/{chat_id}/events/999999999/move", json={"date": after.isoformat()}, headers=BOT_HEADERS)
+    assert gone.status_code == 410

@@ -23,6 +23,7 @@ from app.schemas import (
     BotLinkRequest,
     BotSnoozeRequest,
     BotUndoRequest,
+    MoveToDayRequest,
     ReminderSettingsRead,
     ReminderSettingsUpdate,
 )
@@ -152,6 +153,34 @@ async def draft_cancel(chat_id: int, draft_id: int, session: AsyncSession = Depe
         return await chat.cancel_draft(session, user, draft_id)
     except chat.DraftNotFound:
         raise HTTPException(status_code=410, detail="Draft is gone") from None
+
+
+@router.get("/chat/{chat_id}/events/{event_id}")
+async def event_show(chat_id: int, event_id: int, session: AsyncSession = Depends(get_session)):
+    user = await _user_by_chat(session, chat_id)
+    try:
+        return chat.event_view(await chat.own_event(session, user, event_id), tasks.local_tz(user))
+    except LookupError:
+        raise HTTPException(status_code=404, detail="Event not found") from None
+
+
+@router.post("/chat/{chat_id}/events/{event_id}/move")
+async def event_move(chat_id: int, event_id: int, payload: MoveToDayRequest, session: AsyncSession = Depends(get_session)):
+    user = await _user_by_chat(session, chat_id)
+    try:
+        return await chat.move_event(session, user, event_id, payload.date)
+    except LookupError:
+        raise HTTPException(status_code=410, detail="Event is gone") from None
+
+
+@router.post("/chat/{chat_id}/events/{event_id}/move-date")
+async def event_move_date(chat_id: int, event_id: int, session: AsyncSession = Depends(get_session)):
+    """"✍️ Написать дату": the next message is the task's new day."""
+    user = await _user_by_chat(session, chat_id)
+    try:
+        return await chat.begin_move(session, user, event_id)
+    except LookupError:
+        raise HTTPException(status_code=410, detail="Event is gone") from None
 
 
 @router.post("/chat/{chat_id}/events/{event_id}/complete")

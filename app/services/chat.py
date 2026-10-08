@@ -1069,6 +1069,27 @@ def _clock(value: time | None) -> str | None:
     return value.strftime("%H:%M") if value else None
 
 
+def event_item(event: Event, tz: ZoneInfo) -> dict:
+    """The event's current state as a change item of a draft; "before" is the same state."""
+    start = event.start_at.astimezone(tz)
+    day, last = start.date(), tasks.end_day(event, tz)
+    begins = None if event.all_day else start.time()
+    finishes = None if event.all_day else event.end_at.astimezone(tz).time()
+    state = {"title": event.title, "date": day.isoformat(), "time": _clock(begins), "end_time": _clock(finishes), "end_date": last.isoformat() if last > day else None}
+    return {
+        "event_id": event.id,
+        **state,
+        "rrule": None,
+        "location": event.location,
+        "description": event.description,
+        "reminder_minutes": event.reminder_minutes,
+        "deadline": event.deadline_at.astimezone(tz).strftime("%Y-%m-%dT%H:%M") if event.deadline_at else None,
+        "fixed": event.is_fixed,
+        "tag_ids": list(event.tag_ids or []),
+        "before": state,
+    }
+
+
 def change_item(event: Event, change: dict, tz: ZoneInfo) -> tuple[dict | None, str | None]:
     """The draft item with the event's new state, or a message when the change cannot apply."""
     start, end = event.start_at.astimezone(tz), event.end_at.astimezone(tz)
@@ -1106,20 +1127,12 @@ def change_item(event: Event, change: dict, tz: ZoneInfo) -> tuple[dict | None, 
             if finishes and finishes <= begins and last <= day:
                 finishes = None
     item = {
-        "event_id": event.id,
+        **event_item(event, tz),
         "title": title,
         "date": day.isoformat(),
         "time": _clock(begins),
         "end_time": _clock(finishes) if begins else None,
         "end_date": last.isoformat() if last > day else None,
-        "rrule": None,
-        "location": event.location,
-        "description": event.description,
-        "reminder_minutes": event.reminder_minutes,
-        "deadline": event.deadline_at.astimezone(tz).strftime("%Y-%m-%dT%H:%M") if event.deadline_at else None,
-        "fixed": event.is_fixed,
-        "tag_ids": list(event.tag_ids or []),
-        "before": before,
     }
     if all(item[key] == before[key] for key in before):
         return None, NOTHING_CHANGES
@@ -1751,3 +1764,48 @@ async def move_many(session: AsyncSession, user: User, text: str, tz: ZoneInfo) 
         answer += f"\nЗадач больше {MAX_DRAFT_ITEMS}: здесь первые {MAX_DRAFT_ITEMS}, остальные перенесите следующим сообщением."
     note = "Среди них есть неперемещаемые задачи — проверьте." if any(event.is_fixed for event in events[:MAX_DRAFT_ITEMS]) else None
     return proposal(draft, tz, answer=join_text(night_note(text, now), answer), note=note)
+
+
+# ---------- moving one task with buttons ----------
+
+
+async def own_event(session: AsyncSession, user: User, event_id: int) -> Event:
+    event = await session.get(Event, event_id)
+    if not event or event.user_id != user.id:
+        raise LookupError(event_id)
+    return event
+
+
+async def move_event(session: AsyncSession, user: User, event_id: int, day: date) -> dict:
+    """"Перенести на завтра / послезавтра / другой день" under a task: the task gets the day and keeps its time.
+    The button already says what to do, so it is saved at once; the answer is kept in the chat and can be undone."""
+    usage.current_user_id.set(user.id)
+    tz = tasks.local_tz(user)
+    event = await own_event(session, user, event_id)
+    title = event.title
+    old_day = event.start_at.astimezone(tz).date()
+    item, problem = change_item(event, {"date": day}, tz)
+    if problem:
+        text = f"«{title}» уже стоит на {short_day(day)}." if problem == NOTHING_CHANGES else problem
+        return {"kind": "answer", "text": text}
+    changed = await apply_changes(session, user, [item], tz)
+    reply = {
+        "kind": "updated",
+        "events": [event_view(found, tz) for found in changed],
+        "event_ids": [found.id for found in changed],
+        "answer": None,
+        "text": f"Перенесла «{title}» на {short_day(day)}.",
+        # "Вернуть" moves it back to this day
+        "moved": {"event_id": event_id, "from": old_day.isoformat(), "to": day.isoformat(), "from_label": short_day(old_day)},
+    }
+    message = await remember(session, user.id, "assistant", reply["text"], reply)
+    await session.commit()
+    return {**reply, "message_id": message.id}
+
+
+async def begin_move(session: AsyncSession, user: User, event_id: int) -> dict:
+    """"Другой день" → "написать дату": the next message is the new day of the task, shown for confirmation
+    (the same waiting for a value as "📅 Дата" under a draft)."""
+    event = await own_event(session, user, event_id)
+    draft = await create_draft(session, user, [event_item(event, tasks.local_tz(user))])
+    return await begin_edit(session, user, draft.id, 0, "date") | {"draft_id": draft.id}

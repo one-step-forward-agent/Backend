@@ -363,6 +363,12 @@ class UndoRequest(BaseModel):
     event_ids: list[int] = Field(min_length=1, max_length=500)
 
 
+class MoveToDayRequest(BaseModel):
+    """The new day of a task: "Завтра", "Послезавтра" or a chosen date."""
+
+    date: date
+
+
 class BotTopicRequest(BaseModel):
     index: int = Field(ge=0, lt=5)
 

@@ -25,6 +25,7 @@ from app.schemas import (
     ChatRequest,
     ChatTopic,
     CompleteRequest,
+    MoveToDayRequest,
     RatingRequest,
     UndoRequest,
     DraftUpdate,
@@ -319,6 +320,15 @@ async def assistant_agenda(scope: Literal["today", "tomorrow", "week"], mark: bo
 async def assistant_undo(payload: UndoRequest, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
     """"Отменить" under a confirmed draft: removes the tasks it just created (as the bot's button does)."""
     return {"deleted": await chat.undo(session, user, payload.event_ids)}
+
+
+@router.post("/assistant/events/{event_id}/move")
+async def assistant_move(event_id: int, payload: MoveToDayRequest, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    """"Перенести" in the chat's list of tasks: the task gets the chosen day and keeps its time."""
+    try:
+        return await chat.move_event(session, user, event_id, payload.date)
+    except LookupError:
+        raise HTTPException(status_code=404, detail="Задача не найдена") from None
 
 
 @router.post("/assistant/messages/{message_id}/rating")
