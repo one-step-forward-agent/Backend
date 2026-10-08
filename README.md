@@ -11,8 +11,18 @@ Backend for Focus Day, a calendar assistant built on FastAPI. It stores users, c
 - **Google Calendar**: OAuth login, two-way sync of events and calendars.
 - **Export**: `.ics` export of the user's calendar.
 - **Auth**: email/password registration with Argon2 hashing. Short-lived JWT access tokens plus refresh tokens, sent either as `Authorization: Bearer` or as httpOnly cookies. Every `/api` route is scoped to the current user.
-- **Integrations**: Google Calendar (OAuth), Apple Calendar (iCloud/any CalDAV, app-specific password), Jira Cloud (email + API token), Notion (internal integration token + database), Obsidian (Local REST API plugin). Each one supports test, import (sync) into the local calendar, and export of local events. Credentials are Fernet-encrypted.
+- **Integrations**: Google Calendar (OAuth), Apple Calendar (iCloud/any CalDAV, app-specific password), Jira Cloud (email + API token), Notion (internal integration token + database). Each one supports test, import (sync) into the local calendar, and export of local events. Credentials are Fernet-encrypted.
+- **Tasks**: a task without a stated time is stored as an untimed (all-day) task instead of getting a default time. Recurring tasks ("каждую пятницу в 18:00", "по будням") become a series that is kept filled 90 days ahead. Tasks can be marked completed; `/api/stats` returns daily completion statistics.
+- **Dates**: `app/services/dates.py` resolves Russian date, time and recurrence phrases ("в следующую пятницу", "через два дня", "по вторникам") with `datetime`. GigaChat only reports the phrases it found for each event.
+- **Confirmation stage**: the assistant never creates events right away. It saves a draft that the user can edit (title, date, time, remove items) and then confirms or cancels. This works on the site and in the bot.
+- **Midday check-in and recommendations**: the onboarding answers (`PUT /api/me/onboarding`: work days and hours, goals, tone) are used for the midday check-in in Telegram, which suggests tasks to move to a less busy day, and for the two AI recommendations on the main screen.
 - **Reminders**: per-user settings (lead times, per-event override, daily digest, quiet hours, source filter). The backend queues notifications in an outbox and the Telegram bot delivers them.
+- **Changing tasks in the chat**: "перенеси созвон с Олей на пятницу в 15:00", "продли встречу до 18:00", "сдвинь тренировку на час позже", "переименуй … в …". The assistant finds the task and shows the change (before → after) as a draft; nothing changes until it is confirmed. Multi-day tasks ("с 10 по 12 октября") keep their last day (`end_date` in drafts).
+- **Deleting, completing and analysing in the chat**: "удали все события / встречу с Олей / задачи на завтра" shows exactly what will be removed and deletes only after confirmation; "отметь отчёт выполненным", "я сделала отчёт" mark tasks done; "проанализируй мою неделю", "что можно перенести?" return an analysis plus moves of flexible tasks to confirm. A model reply that claims a change the app did not make ("удалила…") is replaced with an honest one.
+- **Answer ratings**: 👍 / 👎 under assistant answers (site and bot), stored in `conversation_messages.rating`. `python -m app.core.ratings_export > ratings.csv` exports rated answers with the requests before them (decrypted — handle as personal data).
+- **Tags, deadlines, fixed tasks**: `/api/tags` (create, rename, recolor, delete); events carry `tag_ids`, `deadline_at` and `is_fixed` ("нельзя переносить"). `#тег` in a chat message tags the new tasks. Deadline notifications go out 3 days, 1 day and 2 hours before.
+- **Evening summary and streaks**: at the evening time (default 21:00) the bot sends the day's progress, unfinished tasks with a button to move them to tomorrow, and tomorrow's plan. `/api/stats` returns the current and best streak of fully completed days (days without tasks do not break it).
+- **Calendar advice**: `GET /api/recommendations?scope=week|month&day=` analyses the period: busy and free days, deadlines and tasks that cannot be moved, and suggests where to put flexible tasks. `POST /api/assistant/topic` opens the chat about a recommendation.
 
 ## Tech stack
 
@@ -51,8 +61,10 @@ Copy `.env.example` to `.env` and fill in the values:
 | `COOKIE_SECURE` | Mark auth cookies `Secure` (set `true` behind HTTPS) |
 | `CORS_ORIGINS` | Comma-separated extra browser origins allowed to call the API. Empty (default) means same-origin only. `*` is rejected |
 | `ENABLE_DOCS` | Swagger UI and `/openapi.json` (default: on in development, off in production) |
-| `ALLOW_PRIVATE_INTEGRATION_URLS` | Let Jira, CalDAV and Obsidian URLs point to private or loopback addresses (default: on in development, off in production) |
+| `ALLOW_PRIVATE_INTEGRATION_URLS` | Let Jira and CalDAV URLs point to private or loopback addresses (default: on in development, off in production) |
 | `GIGACHAT_CA_BUNDLE` | PEM file with the Russian Trusted Root CA, used to verify GigaChat's TLS certificate |
+| `DATA_ENCRYPTION_KEY` | AES-256 key (32 bytes, base64url) for personal data in the database. **Back it up**: without it the data cannot be read. If empty, a key derived from `SECRET_KEY` is used |
+| `DATA_ENCRYPTION_OLD_KEYS` | Comma-separated previous keys, still used for decryption after a rotation |
 | `INTEGRATIONS_ENCRYPTION_KEY` | Fernet key for integration credentials; derived from `SECRET_KEY` if empty |
 | `BOT_API_TOKEN` | Shared secret for the bot's `/internal/bot/*` API (same value in `tg_bot/.env`) |
 | `TELEGRAM_BOT_USERNAME` | Bot username, used for the `t.me/<bot>?start=<code>` linking link |
@@ -109,23 +121,42 @@ Interactive docs are served at `/docs` (Swagger) and `/redoc`.
 | Health | `GET /health` |
 | Auth | `POST /auth/register`, `POST /auth/login`, `POST /auth/token` (OAuth2 form, for Swagger), `POST /auth/refresh`, `POST /auth/logout` |
 | Google OAuth | `GET /auth/google/login`, `GET /auth/google/callback`, `POST /auth/google/disconnect` |
-| Profile | `GET/PATCH /api/me` |
+| Profile | `GET/PATCH /api/me`, `PUT /api/me/onboarding` |
 | Calendars | `GET/POST /api/calendars`, `GET /api/calendars/{id}`, `POST /api/calendars/{id}/sync` |
-| Events | `GET/POST /api/events`, `GET/PUT/DELETE /api/events/{id}`, `POST /api/events/{id}/sync/google`, `GET /api/events/{id}/links` |
+| Events | `GET/POST /api/events` (`recurrence_rule` creates a series), `GET/PUT/DELETE /api/events/{id}` (`?scope=series` deletes this and later occurrences), `POST /api/events/{id}/complete`, `POST /api/events/move`, `POST /api/events/{id}/sync/google`, `GET /api/events/{id}/links` |
+| Statistics | `GET /api/stats?days=7`, `GET /api/recommendations` |
 | Integrations | `GET /api/integrations`, `POST /api/integrations/{provider}/connect`, `.../test`, `.../sync`, `POST /api/integrations/{provider}/export/{event_id}`, `DELETE /api/integrations/{provider}?purge=` |
 | Reminders | `GET/PUT /api/reminders/settings`, `POST /api/reminders/test`, `GET /api/reminders/history` |
 | Telegram | `GET/DELETE /api/telegram`, `POST /api/telegram/link` |
-| Bot (internal, `X-Bot-Token`) | `/internal/bot/link`, `/unlink/{chat_id}`, `/users/{chat_id}/reminder-settings`, `/notifications/claim`, `/notifications/{id}/ack` |
+| Bot (internal, `X-Bot-Token`) | `/internal/bot/link`, `/unlink/{chat_id}`, `/users/{chat_id}/reminder-settings`, `/chat/{chat_id}` (message → proposal, agenda or answer), `/chat/{chat_id}/drafts/{id}` (+ `/edit`, `/remove`, `/confirm`, `/cancel`), `/chat/{chat_id}/events/{id}/complete`, `/chat/{chat_id}/stats`, `/notifications/claim`, `/notifications/{id}/ack`, `/notifications/{id}/snooze`, `/notifications/{id}/checkin` |
 | Files | `POST/GET /api/events/{id}/files`, `DELETE /api/files/{id}`, `POST /api/files/{id}/text` |
-| Assistant | `POST /api/assistant/message`, `POST /api/assistant/confirm`, `POST /api/assistant/search`, `POST /api/assistant/transcribe`, `POST /api/assistant/file` |
+| Assistant | `POST /api/assistant/chat` (proposal → `PUT /api/assistant/drafts/{id}`, `POST .../confirm`, `DELETE`), `POST /api/assistant/search`, `POST /api/assistant/transcribe`, `POST /api/assistant/file`; legacy `POST /api/assistant/message`, `POST /api/assistant/confirm` |
 | Export | `GET /api/calendar/export.ics` |
 
 ### Reminder flow
 
 1. On the site the user clicks "Подключить Telegram" and gets a deep link `t.me/<bot>?start=<code>` (single-use, valid for 15 minutes).
 2. The bot receives `/start <code>` and calls `/internal/bot/link`, which stores the chat id on the user.
-3. Every `NOTIFICATION_POLL_SECONDS` the bot calls `/notifications/claim`. That call queues due reminders and digests (deduplicated by a key), skips quiet hours, expires stale items, and hands the batch to the bot (`FOR UPDATE SKIP LOCKED`, so several bot instances are safe).
+3. Every `NOTIFICATION_POLL_SECONDS` the bot calls `/notifications/claim`. That call extends recurring series, queues due reminders, digests and the midday check-in (deduplicated by a key), skips quiet hours, expires stale items, and hands the batch to the bot (`FOR UPDATE SKIP LOCKED`, so several bot instances are safe).
 4. The bot sends each message and acks it. Transient errors are retried up to 3 times. If the user blocked the bot, Telegram is unlinked.
+
+## Data encryption
+
+Personal data is encrypted in the application before it reaches PostgreSQL (AES-256-GCM, `app/core/dataenc.py`), so a database dump or leaked backup shows only ciphertext:
+
+- users: email, name, Telegram username, onboarding profile (login uses `email_hash`, an HMAC of the email);
+- tasks: title, description, location; calendar names; file names; integration account emails;
+- assistant history and drafts; reminder and check-in texts.
+
+Dates and times, ids and statuses stay readable, because the calendar, reminders and statistics filter and sort by them. Passwords are Argon2 hashes; integration credentials are encrypted with `INTEGRATIONS_ENCRYPTION_KEY`.
+
+The key is read from the environment and never stored in the database. Migration `0023` encrypts existing rows. To set or rotate the key: put the new key in `DATA_ENCRYPTION_KEY`, keep the previous one in `DATA_ENCRYPTION_OLD_KEYS` (not needed when moving from the `SECRET_KEY`-derived key), then run `python -m app.core.reencrypt`. Until `DATA_ENCRYPTION_KEY` is set, **do not change `SECRET_KEY`**: the data key is derived from it.
+
+Encryption at rest does not protect against a compromised server (the server holds the key) or data already sent to GigaChat, Google Calendar or Telegram.
+
+## Tests
+
+See `tests/README.md`: `tests/test_dates.py` runs without a database, the rest need PostgreSQL migrated to head.
 
 ## Migrations
 

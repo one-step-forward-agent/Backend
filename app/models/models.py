@@ -1,11 +1,12 @@
 from datetime import datetime, time
 from enum import StrEnum
 
-from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, String, Text, Time, UniqueConstraint, func
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, SmallInteger, String, Text, Time, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
 from app.core.database import Base
+from app.core.dataenc import EncryptedJSON, EncryptedText, email_index
 
 
 class Provider(StrEnum):
@@ -15,7 +16,6 @@ class Provider(StrEnum):
     APPLE = "apple"
     JIRA = "jira"
     NOTION = "notion"
-    OBSIDIAN = "obsidian"
 
 
 class Priority(StrEnum):
@@ -44,22 +44,31 @@ class User(Base):
     __tablename__ = "users"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    email: Mapped[str] = mapped_column(String(320), unique=True, index=True)
-    name: Mapped[str | None] = mapped_column(String(200))
+    # Personal fields are encrypted at rest; email_hash finds a user by email without decrypting
+    email: Mapped[str] = mapped_column(EncryptedText("users.email"))
+    email_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    name: Mapped[str | None] = mapped_column(EncryptedText("users.name"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     password_hash: Mapped[str | None] = mapped_column(String(255))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     timezone: Mapped[str | None] = mapped_column(Text)
     telegram_chat_id: Mapped[int | None] = mapped_column(BigInteger, unique=True)
-    telegram_username: Mapped[str | None] = mapped_column(String(64))
+    telegram_username: Mapped[str | None] = mapped_column(EncryptedText("users.telegram_username"))
     telegram_linked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     telegram_link_code: Mapped[str | None] = mapped_column(String(64), unique=True)
     telegram_link_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Onboarding answers: purpose, spheres, goals, tone of voice, work days and hours
+    profile: Mapped[dict] = mapped_column(EncryptedJSON("users.profile"), default=dict, server_default="{}")
     calendars: Mapped[list["Calendar"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     events: Mapped[list["Event"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     integrations: Mapped[list["Integration"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     reminder_settings: Mapped["ReminderSettings | None"] = relationship(back_populates="user", cascade="all, delete-orphan", uselist=False)
+
+    @validates("email")
+    def _index_email(self, _key: str, value: str) -> str:
+        self.email_hash = email_index(value)
+        return value
 
 
 class Calendar(Base):
@@ -69,10 +78,10 @@ class Calendar(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     integration_id: Mapped[int | None] = mapped_column(ForeignKey("integrations.id", ondelete="SET NULL"), index=True)
-    name: Mapped[str] = mapped_column(String(200))
+    name: Mapped[str] = mapped_column(EncryptedText("calendars.name"))
     provider: Mapped[str] = mapped_column(String(20), default=Provider.LOCAL)
     external_id: Mapped[str | None] = mapped_column(String(255))
-    description: Mapped[str | None] = mapped_column(Text)
+    description: Mapped[str | None] = mapped_column(EncryptedText("calendars.description"))
     timezone: Mapped[str] = mapped_column(String(64), default="UTC")
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     user: Mapped[User] = relationship(back_populates="calendars")
@@ -86,19 +95,28 @@ class Event(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     calendar_id: Mapped[int] = mapped_column(ForeignKey("calendars.id", ondelete="CASCADE"), index=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
-    title: Mapped[str] = mapped_column(String(300))
-    description: Mapped[str | None] = mapped_column(Text)
+    title: Mapped[str] = mapped_column(EncryptedText("events.title"))
+    description: Mapped[str | None] = mapped_column(EncryptedText("events.description"))
     start_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     end_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     timezone: Mapped[str] = mapped_column(String(64), default="UTC")
     status: Mapped[str] = mapped_column(String(20), default="confirmed")
     priority: Mapped[str] = mapped_column(String(20), default=Priority.MEDIUM)
-    location: Mapped[str | None] = mapped_column(String(500))
+    location: Mapped[str | None] = mapped_column(EncryptedText("events.location"))
     source: Mapped[str] = mapped_column(String(20), default=Provider.LOCAL)
     external_id: Mapped[str | None] = mapped_column(String(255), unique=True)
     sync_status: Mapped[str] = mapped_column(String(20), default=SyncStatus.NOT_SYNCED)
     all_day: Mapped[bool] = mapped_column(Boolean, default=False)
     reminder_minutes: Mapped[int | None] = mapped_column(Integer)
+    # Occurrences of a recurring task share series_id; each keeps the rule so the series can be extended
+    recurrence_rule: Mapped[str | None] = mapped_column(Text)
+    series_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # The latest moment the task must be done by; independent of when it is planned
+    deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    # A task that cannot be moved (a meeting, an exam): suggestions plan around it
+    is_fixed: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    tag_ids: Mapped[list[int]] = mapped_column(ARRAY(Integer), default=list, server_default="{}")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     calendar: Mapped[Calendar] = relationship(back_populates="events")
@@ -106,13 +124,23 @@ class Event(Base):
     metadata_record: Mapped["EventMetadata | None"] = relationship(back_populates="event", cascade="all, delete-orphan", uselist=False)
 
 
+class Tag(Base):
+    __tablename__ = "tags"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(EncryptedText("tags.name"))
+    color: Mapped[str] = mapped_column(String(20), default="indigo", server_default="indigo")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class EventMetadata(Base):
     __tablename__ = "event_metadata"
 
     id: Mapped[int] = mapped_column(primary_key=True)
     event_id: Mapped[int] = mapped_column(ForeignKey("events.id", ondelete="CASCADE"), unique=True)
-    notes: Mapped[str | None] = mapped_column(Text)
-    tags: Mapped[str | None] = mapped_column(Text)
+    notes: Mapped[str | None] = mapped_column(EncryptedText("event_metadata.notes"))
+    tags: Mapped[str | None] = mapped_column(EncryptedText("event_metadata.tags"))
     estimated_duration: Mapped[int | None] = mapped_column(Integer)
     actual_duration: Mapped[int | None] = mapped_column(Integer)
     event: Mapped[Event] = relationship(back_populates="metadata_record")
@@ -123,7 +151,7 @@ class EventFile(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     event_id: Mapped[int] = mapped_column(ForeignKey("events.id", ondelete="CASCADE"), index=True)
-    original_filename: Mapped[str] = mapped_column(String(255))
+    original_filename: Mapped[str] = mapped_column(EncryptedText("event_files.original_filename"))
     stored_filename: Mapped[str] = mapped_column(String(255), unique=True)
     mime_type: Mapped[str] = mapped_column(String(100))
     file_size: Mapped[int] = mapped_column(Integer)
@@ -136,7 +164,7 @@ class Integration(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     provider: Mapped[str] = mapped_column(String(30))
-    account_email: Mapped[str | None] = mapped_column(String(320))
+    account_email: Mapped[str | None] = mapped_column(EncryptedText("integrations.account_email"))
     credentials_encrypted: Mapped[str | None] = mapped_column(Text)
     config: Mapped[dict] = mapped_column(JSONB, default=dict)
     token_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -170,6 +198,11 @@ class ReminderSettings(Base):
     quiet_hours_start: Mapped[time] = mapped_column(Time, default=time(23, 0))
     quiet_hours_end: Mapped[time] = mapped_column(Time, default=time(8, 0))
     sources: Mapped[list[str]] = mapped_column(ARRAY(String(20)), default=list)
+    checkin_enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
+    checkin_time: Mapped[time] = mapped_column(Time, default=time(13, 0), server_default="13:00")
+    evening_enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
+    evening_time: Mapped[time] = mapped_column(Time, default=time(21, 0), server_default="21:00")
+    deadline_enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     user: Mapped[User] = relationship(back_populates="reminder_settings")
 
@@ -182,7 +215,7 @@ class Notification(Base):
     event_id: Mapped[int | None] = mapped_column(ForeignKey("events.id", ondelete="CASCADE"), index=True)
     kind: Mapped[str] = mapped_column(String(20))
     dedupe_key: Mapped[str] = mapped_column(String(255), unique=True)
-    text: Mapped[str] = mapped_column(Text)
+    text: Mapped[str] = mapped_column(EncryptedText("notifications.text"))
     scheduled_for: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     status: Mapped[str] = mapped_column(String(20), default=NotificationStatus.PENDING, index=True)
@@ -190,6 +223,8 @@ class Notification(Base):
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     error: Mapped[str | None] = mapped_column(Text)
+    # Data for the bot's buttons, e.g. the tasks a midday check-in suggests moving
+    payload: Mapped[dict | None] = mapped_column(JSONB)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -210,5 +245,42 @@ class ConversationMessage(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(BigInteger, index=True)
     role: Mapped[str] = mapped_column(Text)
-    content: Mapped[str] = mapped_column(Text)
+    content: Mapped[str] = mapped_column(EncryptedText("conversation_messages.content"))
+    # The full assistant reply, so the chat history shows proposals and results after a reload
+    reply: Mapped[dict | None] = mapped_column(EncryptedJSON("conversation_messages.reply"))
+    # The draft this reply proposed; confirming or editing the draft updates the message
+    draft_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    # The user's 👍 (1) or 👎 (-1) for an assistant answer
+    rating: Mapped[int | None] = mapped_column(SmallInteger)
+    rated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class AssistantDraft(Base):
+    """Events the assistant proposed and the user has not confirmed yet."""
+
+    __tablename__ = "assistant_drafts"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    items: Mapped[list[dict]] = mapped_column(EncryptedJSON("assistant_drafts.items"))
+    # {"index": n, "field": "title" | "date" | "time"} while the bot waits for a new value
+    # none_as_null: "not waiting" must be SQL NULL — JSON null made every draft look like it waited for an edit
+    awaiting: Mapped[dict | None] = mapped_column(JSONB(none_as_null=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class RecommendationCache(Base):
+    """The last recommendations per user and screen, reused until the plan changes (see insights.cache_key)."""
+
+    __tablename__ = "recommendation_cache"
+    __table_args__ = (UniqueConstraint("user_id", "scope", name="uq_recommendation_cache_user_scope"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    # "today", or a calendar period such as "week:2026-10-05" or "month:2026-10-01"
+    scope: Mapped[str] = mapped_column(String(40), default="today", server_default="today")
+    key: Mapped[str] = mapped_column(String(64))
+    items: Mapped[list[dict]] = mapped_column(EncryptedJSON("recommendation_cache.items"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))

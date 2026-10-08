@@ -1,3 +1,4 @@
+from datetime import date
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -12,14 +13,20 @@ from app.models.models import Notification, User
 from app.schemas import (
     BotAckRequest,
     BotChatRequest,
+    BotCheckinRequest,
     BotClaimRequest,
+    BotCompleteRequest,
+    BotEditRequest,
+    BotRatingRequest,
+    BotTopicRequest,
+    BotRemoveRequest,
     BotLinkRequest,
     BotSnoozeRequest,
     BotUndoRequest,
     ReminderSettingsRead,
     ReminderSettingsUpdate,
 )
-from app.services import chat, reminders
+from app.services import chat, reminders, tasks
 from app.services.integrations.service import user_timezone
 
 router = APIRouter(prefix="/internal/bot", tags=["bot"], dependencies=[Depends(require_bot)], include_in_schema=False)
@@ -64,6 +71,28 @@ async def chat_message(chat_id: int, payload: BotChatRequest, session: AsyncSess
         raise HTTPException(status_code=503, detail="Assistant is unavailable") from None
 
 
+@router.post("/chat/{chat_id}/messages/{message_id}/rating")
+async def chat_rating(chat_id: int, message_id: int, payload: BotRatingRequest, session: AsyncSession = Depends(get_session)):
+    user = await _user_by_chat(session, chat_id)
+    try:
+        return await chat.rate(session, user, message_id, payload.value)
+    except LookupError:
+        raise HTTPException(status_code=404, detail="Message not found") from None
+
+
+@router.post("/chat/{chat_id}/topic")
+async def chat_topic(chat_id: int, payload: BotTopicRequest, session: AsyncSession = Depends(get_session)):
+    """"Обсудить" under advice in Telegram: the recommendation becomes the topic, as in the web chat."""
+    from app.services import insights
+
+    user = await _user_by_chat(session, chat_id)
+    items = await insights.recommendations(session, user)
+    if payload.index >= len(items):
+        raise HTTPException(status_code=404, detail="Recommendation not found")
+    item = items[payload.index]
+    return await chat.remember_topic(session, user, item["title"], item["text"])
+
+
 @router.get("/chat/{chat_id}/agenda/{scope}")
 async def chat_agenda(chat_id: int, scope: Literal["today", "tomorrow", "week"], session: AsyncSession = Depends(get_session)):
     return await chat.agenda(session, await _user_by_chat(session, chat_id), scope)
@@ -73,6 +102,70 @@ async def chat_agenda(chat_id: int, scope: Literal["today", "tomorrow", "week"],
 async def chat_undo(chat_id: int, payload: BotUndoRequest, session: AsyncSession = Depends(get_session)):
     user = await _user_by_chat(session, chat_id)
     return {"deleted": await chat.undo(session, user, payload.event_ids)}
+
+
+@router.post("/chat/{chat_id}/drafts/{draft_id}/edit")
+async def draft_edit(chat_id: int, draft_id: int, payload: BotEditRequest, session: AsyncSession = Depends(get_session)):
+    user = await _user_by_chat(session, chat_id)
+    try:
+        return await chat.begin_edit(session, user, draft_id, payload.index, payload.field)
+    except chat.DraftNotFound:
+        raise HTTPException(status_code=410, detail="Draft is gone") from None
+
+
+@router.post("/chat/{chat_id}/drafts/{draft_id}/remove")
+async def draft_remove(chat_id: int, draft_id: int, payload: BotRemoveRequest, session: AsyncSession = Depends(get_session)):
+    user = await _user_by_chat(session, chat_id)
+    try:
+        return await chat.remove_item(session, user, draft_id, payload.index)
+    except chat.DraftNotFound:
+        raise HTTPException(status_code=410, detail="Draft is gone") from None
+
+
+@router.get("/chat/{chat_id}/drafts/{draft_id}")
+async def draft_show(chat_id: int, draft_id: int, session: AsyncSession = Depends(get_session)):
+    user = await _user_by_chat(session, chat_id)
+    try:
+        draft = await chat.get_draft(session, user, draft_id)
+    except chat.DraftNotFound:
+        raise HTTPException(status_code=410, detail="Draft is gone") from None
+    if draft.awaiting:
+        draft.awaiting = None
+        await session.commit()
+    return chat.proposal(draft, tasks.local_tz(user))
+
+
+@router.post("/chat/{chat_id}/drafts/{draft_id}/confirm")
+async def draft_confirm(chat_id: int, draft_id: int, session: AsyncSession = Depends(get_session)):
+    user = await _user_by_chat(session, chat_id)
+    try:
+        return await chat.confirm_draft(session, user, draft_id)
+    except chat.DraftNotFound:
+        raise HTTPException(status_code=410, detail="Draft is gone") from None
+
+
+@router.post("/chat/{chat_id}/drafts/{draft_id}/cancel")
+async def draft_cancel(chat_id: int, draft_id: int, session: AsyncSession = Depends(get_session)):
+    user = await _user_by_chat(session, chat_id)
+    try:
+        return await chat.cancel_draft(session, user, draft_id)
+    except chat.DraftNotFound:
+        raise HTTPException(status_code=410, detail="Draft is gone") from None
+
+
+@router.post("/chat/{chat_id}/events/{event_id}/complete")
+async def complete(chat_id: int, event_id: int, payload: BotCompleteRequest, session: AsyncSession = Depends(get_session)):
+    user = await _user_by_chat(session, chat_id)
+    event = await tasks.set_completed(session, user, event_id, payload.completed)
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+    return chat.event_view(event, tasks.local_tz(user))
+
+
+@router.get("/chat/{chat_id}/stats")
+async def stats(chat_id: int, days: int = 7, session: AsyncSession = Depends(get_session)):
+    user = await _user_by_chat(session, chat_id)
+    return await tasks.daily_stats(session, user, min(max(days, 1), 31))
 
 
 @router.post("/unlink/{chat_id}")
@@ -125,3 +218,19 @@ async def snooze(notification_id: int, payload: BotSnoozeRequest, session: Async
         raise HTTPException(status_code=404, detail="Notification not found")
     copy = await reminders.snooze(session, notification, payload.minutes)
     return {"scheduled_for": copy.scheduled_for}
+
+
+@router.post("/notifications/{notification_id}/checkin")
+async def checkin_action(notification_id: int, payload: BotCheckinRequest, session: AsyncSession = Depends(get_session)):
+    notification = await session.get(Notification, notification_id)
+    user = await session.get(User, notification.user_id) if notification else None
+    # The midday check-in and the evening summary both offer to move tasks
+    if not notification or notification.kind not in ("checkin", "evening") or not user or user.telegram_chat_id != payload.chat_id:
+        raise HTTPException(status_code=404, detail="Notification not found")
+    data = notification.payload or {}
+    if payload.action == "ok" or not data.get("event_ids"):
+        return {"moved": 0, "target_label": data.get("target_label")}
+    moved = await tasks.move_events(session, user, data["event_ids"], date.fromisoformat(data["target"]))
+    notification.payload = {**data, "event_ids": []}
+    await session.commit()
+    return {"moved": moved, "target_label": data.get("target_label")}

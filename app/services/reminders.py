@@ -3,18 +3,24 @@ import secrets
 from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import and_, or_, select, text, update
+from sqlalchemy import and_, bindparam, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.dataenc import email_lookup
 from app.models.models import Event, Notification, NotificationStatus, ReminderSettings, User
+from app.services import insights, tasks
 from app.services.events import default_calendar
 from app.services.integrations.service import user_timezone
 from app.services.ru import MONTHS, WEEKDAYS_ACCUSATIVE, plural, relative_day, time_range
 
 MAX_LEAD_MINUTES = 7 * 24 * 60
 DIGEST_WINDOW = timedelta(hours=6)
+CHECKIN_WINDOW = timedelta(hours=3)
+EVENING_WINDOW = timedelta(hours=3)
+# Deadline notifications: 3 days, 1 day and 2 hours before
+DEADLINE_STAGES = (4320, 1440, 120)
 CLAIM_TIMEOUT = timedelta(minutes=5)
 MAX_ATTEMPTS = 3
 LINK_CODE_LIFETIME = timedelta(minutes=15)
@@ -26,9 +32,10 @@ LEGACY_EVENTS = text(
     "WHERE user_id = :chat_id AND start_at IS NULL AND starts_at IS NOT NULL"
 )
 LEGACY_CONVERSATION = text("UPDATE conversation_messages SET user_id = :user_id WHERE user_id = :chat_id")
+# Placeholder users of the old bot had the email "<chat id>@local.invalid"; emails are encrypted, so match its hash
 LEGACY_PLACEHOLDER_USER = text(
-    "DELETE FROM users WHERE tg_id = :chat_id AND id <> :user_id AND password_hash IS NULL AND email LIKE '%@local.invalid'"
-)
+    "DELETE FROM users WHERE tg_id = :chat_id AND id <> :user_id AND password_hash IS NULL AND email_hash IN :hashes"
+).bindparams(bindparam("hashes", expanding=True))
 
 
 async def get_settings(session: AsyncSession, user: User) -> ReminderSettings:
@@ -81,13 +88,31 @@ def digest_text(events: list[Event], day: datetime, tz: ZoneInfo) -> str:
     count = len(events)
     lines = ["☀️ <b>Доброе утро!</b>", f"План на {date_text} — {count} {plural(count, 'событие', 'события', 'событий')}", ""]
     for event in events:
-        when = "весь день" if event.all_day else f"{event.start_at.astimezone(tz):%H:%M}"
+        when = "без времени" if event.all_day else f"{event.start_at.astimezone(tz):%H:%M}"
         line = f"<b>{when}</b>  {html.escape(event.title)}"
         if event.location:
             line += f"  · 📍 {html.escape(event.location)}"
         lines.append(line)
     lines += ["", "Хорошего дня ✨"]
     return "\n".join(lines)
+
+
+def deadline_text(event: Event, now: datetime, tz: ZoneInfo) -> str:
+    deadline = event.deadline_at.astimezone(tz)
+    local_now = now.astimezone(tz)
+    left = deadline - local_now
+    if left < timedelta(hours=1):
+        lead = f"через {max(1, int(left.total_seconds() // 60))} мин"
+    elif left < timedelta(days=1):
+        hours = int(left.total_seconds() // 3600)
+        lead = f"через {hours} {plural(hours, 'час', 'часа', 'часов')}"
+    else:
+        days = (deadline.date() - local_now.date()).days
+        lead = f"через {days} {plural(days, 'день', 'дня', 'дней')}"
+    when = relative_day(deadline.date(), local_now.date())
+    if deadline.time() < time(23, 59):
+        when += f" в {deadline:%H:%M}"
+    return f"⏳ <b>Дедлайн {lead}</b>\n\n<b>{html.escape(event.title)}</b>\nСрок: {when}"
 
 
 async def generate_due(session: AsyncSession, now: datetime) -> int:
@@ -100,7 +125,7 @@ async def generate_due(session: AsyncSession, now: datetime) -> int:
     for user, reminder_settings in rows.all():
         tz = ZoneInfo(user_timezone(user))
         leads = sorted({minutes for minutes in reminder_settings.lead_times or [] if 0 <= minutes <= MAX_LEAD_MINUTES})
-        conditions = [Event.user_id == user.id, Event.start_at > now, Event.all_day.is_(False)]
+        conditions = [Event.user_id == user.id, Event.start_at > now, Event.all_day.is_(False), Event.completed_at.is_(None)]
         conditions.append(
             or_(
                 Event.start_at <= now + timedelta(minutes=max(leads, default=0)),
@@ -148,14 +173,81 @@ async def generate_due(session: AsyncSession, now: datetime) -> int:
                         "expires_at": day_end,
                     }
                 )
+
+        if reminder_settings.deadline_enabled:
+            deadline_conditions = [
+                Event.user_id == user.id,
+                Event.completed_at.is_(None),
+                Event.deadline_at.is_not(None),
+                Event.deadline_at > now,
+                Event.deadline_at <= now + timedelta(minutes=max(DEADLINE_STAGES)),
+            ]
+            for event in await session.scalars(select(Event).where(*deadline_conditions)):
+                stage = min(minutes for minutes in DEADLINE_STAGES if event.deadline_at - timedelta(minutes=minutes) <= now)
+                values.append(
+                    {
+                        "user_id": user.id,
+                        "event_id": event.id,
+                        "kind": "deadline",
+                        "dedupe_key": f"deadline:{event.id}:{int(event.deadline_at.timestamp())}:{stage}",
+                        "text": deadline_text(event, now, tz),
+                        "scheduled_for": now,
+                        "expires_at": event.deadline_at,
+                    }
+                )
+
+        if reminder_settings.evening_enabled:
+            local_now = now.astimezone(tz)
+            evening_at = datetime.combine(local_now.date(), reminder_settings.evening_time, tz)
+            dedupe_key = f"evening:{user.id}:{local_now.date().isoformat()}"
+            if evening_at <= local_now < evening_at + EVENING_WINDOW and not await session.scalar(select(Notification.id).where(Notification.dedupe_key == dedupe_key)):
+                found = await insights.evening(session, user, local_now)
+                if found:
+                    text_body, payload = found
+                    values.append(
+                        {
+                            "user_id": user.id,
+                            "event_id": None,
+                            "kind": "evening",
+                            "dedupe_key": dedupe_key,
+                            "text": text_body,
+                            "payload": payload,
+                            "scheduled_for": now,
+                            "expires_at": datetime.combine(local_now.date() + timedelta(days=1), time(6, 0), tz),
+                        }
+                    )
+
+        if reminder_settings.checkin_enabled:
+            local_now = now.astimezone(tz)
+            checkin_at = datetime.combine(local_now.date(), reminder_settings.checkin_time, tz)
+            dedupe_key = f"checkin:{user.id}:{local_now.date().isoformat()}"
+            if checkin_at <= local_now < checkin_at + CHECKIN_WINDOW and not await session.scalar(select(Notification.id).where(Notification.dedupe_key == dedupe_key)):
+                found = await insights.checkin(session, user, local_now)
+                if found:
+                    text_body, payload = found
+                    values.append(
+                        {
+                            "user_id": user.id,
+                            "event_id": None,
+                            "kind": "checkin",
+                            "dedupe_key": dedupe_key,
+                            "text": text_body,
+                            "payload": payload,
+                            "scheduled_for": now,
+                            "expires_at": datetime.combine(local_now.date() + timedelta(days=1), time.min, tz),
+                        }
+                    )
     if not values:
         return 0
+    for value in values:
+        value.setdefault("payload", None)
     result = await session.execute(insert(Notification).values(values).on_conflict_do_nothing(index_elements=["dedupe_key"]))
     return result.rowcount or 0
 
 
 async def claim(session: AsyncSession, limit: int = 50) -> list[dict]:
     now = datetime.now(timezone.utc)
+    await tasks.extend_series(session, now)
     await generate_due(session, now)
     await session.execute(
         update(Notification)
@@ -195,6 +287,7 @@ async def claim(session: AsyncSession, limit: int = 50) -> list[dict]:
                 "text": notification.text,
                 "kind": notification.kind,
                 "event_id": notification.event_id,
+                "payload": notification.payload,
                 "url": f"{settings.public_app_url}/app/events/{notification.event_id}" if settings.public_app_url and notification.event_id else None,
             }
         )
@@ -274,7 +367,7 @@ async def import_legacy_bot_data(session: AsyncSession, user: User, chat_id: int
     params = {"user_id": user.id, "chat_id": chat_id, "calendar_id": calendar.id, "timezone": user_timezone(user)}
     await session.execute(LEGACY_EVENTS, params)
     await session.execute(LEGACY_CONVERSATION, params)
-    await session.execute(LEGACY_PLACEHOLDER_USER, params)
+    await session.execute(LEGACY_PLACEHOLDER_USER, {**params, "hashes": email_lookup(f"{chat_id}@local.invalid")})
 
 
 async def snooze(session: AsyncSession, notification: Notification, minutes: int) -> Notification:
