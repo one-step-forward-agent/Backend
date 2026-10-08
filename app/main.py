@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 from app.api import integrations, internal, reminders
 from app.api.auth import google_router, yandex_router, apple_router, notion_router, jira_router, obsidian_router,  session_router
 from app.api.routes import router
+from app.core import errors
 from app.core.config import settings
 from app.core.database import engine
 from app.models import models  # noqa: F401
@@ -31,6 +32,7 @@ async def lifespan(_: FastAPI):
 
 docs = {} if settings.enable_docs else {"docs_url": None, "redoc_url": None, "openapi_url": None}
 app = FastAPI(title="Dayla API", version="0.1.0", lifespan=lifespan, **docs)
+errors.install(app)
 
 
 @app.middleware("http")
@@ -57,7 +59,7 @@ def _same_origin_or_allowed(request: Request) -> bool:
 @app.middleware("http")
 async def reject_cross_site_writes(request: Request, call_next):
     if request.method in UNSAFE_METHODS and not _same_origin_or_allowed(request):
-        return JSONResponse({"detail": "Cross-site request blocked"}, status_code=403)
+        return JSONResponse({"detail": errors.SERVER_ERROR}, status_code=403)
     return await call_next(request)
 
 

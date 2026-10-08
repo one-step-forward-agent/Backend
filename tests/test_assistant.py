@@ -239,7 +239,7 @@ async def test_assistant_failure_is_reported_as_temporary(client, user, monkeypa
     headers, _ = user
     response = await client.post("/api/assistant/chat", json={"text": "расскажи анекдот"}, headers=headers)
     assert response.status_code == 503
-    assert "Временная ошибка" in response.json()["detail"] and "GigaChat" not in response.json()["detail"]
+    assert response.json() == {"detail": "Ошибка сервера. Попробуйте ещё раз позже."}
 
 
 def test_persona_is_female():

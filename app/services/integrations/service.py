@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -5,10 +6,13 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.errors import SERVER_ERROR, plain
 from app.core.crypto import decrypt_json, encrypt_json
 from app.models.models import Calendar, Event, EventLink, Integration, SyncStatus, User
 from app.services.integrations.base import EventPayload, IntegrationError, IntegrationProvider, ProviderContext
 from app.services.integrations.registry import PROVIDERS
+
+logger = logging.getLogger(__name__)
 
 SYNC_PAST = timedelta(days=7)
 SYNC_FUTURE = timedelta(days=60)
@@ -79,7 +83,9 @@ async def verify_integration(session: AsyncSession, user: User, integration: Int
         account = await provider.verify()
     except IntegrationError as error:
         integration.status = "error"
-        integration.last_sync_error = str(error)
+        # Shown on the integration card: plain words only, details stay in the log
+        integration.last_sync_error = plain(str(error)) or SERVER_ERROR
+        logger.warning("%s sync failed for user %s: %s", integration.provider, user.id, error)
         await session.commit()
         raise
     _persist_rotated_secrets(integration, provider)
@@ -98,7 +104,9 @@ async def sync_integration(session: AsyncSession, user: User, integration: Integ
         items = await provider.fetch_items(now - SYNC_PAST, now + SYNC_FUTURE)
     except IntegrationError as error:
         integration.status = "error"
-        integration.last_sync_error = str(error)
+        # Shown on the integration card: plain words only, details stay in the log
+        integration.last_sync_error = plain(str(error)) or SERVER_ERROR
+        logger.warning("%s sync failed for user %s: %s", integration.provider, user.id, error)
         await session.commit()
         raise
     _persist_rotated_secrets(integration, provider)
