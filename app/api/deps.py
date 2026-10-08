@@ -9,6 +9,7 @@ from app.core.auth import decode_access_token
 from app.core.config import settings
 from app.core.database import get_session
 from app.models.models import User
+from app.services import usage
 
 ACCESS_COOKIE = "focus_day_access"
 REFRESH_COOKIE = "focus_day_refresh"
@@ -35,6 +36,8 @@ async def get_current_user(
     user = await session.get(User, user_id)
     if not user or not user.is_active:
         raise _unauthorized("Пользователь не найден или отключён")
+    # Language model tokens spent in this request are counted for this user
+    usage.current_user_id.set(user.id)
     return user
 
 

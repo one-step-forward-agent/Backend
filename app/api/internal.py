@@ -26,7 +26,7 @@ from app.schemas import (
     ReminderSettingsRead,
     ReminderSettingsUpdate,
 )
-from app.services import chat, reminders, tasks
+from app.services import chat, reminders, tasks, usage
 from app.services.integrations.service import user_timezone
 
 router = APIRouter(prefix="/internal/bot", tags=["bot"], dependencies=[Depends(require_bot)], include_in_schema=False)
@@ -36,6 +36,7 @@ async def _user_by_chat(session: AsyncSession, chat_id: int) -> User:
     user = await session.scalar(select(User).where(User.telegram_chat_id == chat_id))
     if not user:
         raise HTTPException(status_code=404, detail="Telegram chat is not linked")
+    usage.current_user_id.set(user.id)
     return user
 
 

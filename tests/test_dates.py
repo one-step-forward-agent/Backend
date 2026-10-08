@@ -3,7 +3,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from app.services.dates import describe_rrule, first_occurrence, parse, parse_time, strip_spans, valid_rrule
+from app.services.dates import bare_day, describe_rrule, first_occurrence, parse, parse_time, strip_spans, valid_rrule
 
 TZ = ZoneInfo("Europe/Moscow")
 NOW = datetime(2026, 10, 6, 10, 0, tzinfo=TZ)  # Tuesday
@@ -164,3 +164,41 @@ def test_times_written_with_a_space_dash_or_bare_dot():
     assert (ranged.time, ranged.end_time) == (time(10, 0), time(12, 0))  # a range of hours, not 10:12
     assert dates.parse("10.11", now).date is not None and dates.parse("10.11", now).time is None  # a date
     assert dates.parse("в 10 15 октября", now).time == time(10, 0)
+
+
+NIGHT = datetime(2026, 10, 9, 1, 12, tzinfo=TZ)  # Friday night: the user's "today" is still Thursday the 8th
+
+
+@pytest.mark.parametrize(
+    "text, now, expected",
+    [
+        # Ordinal days of the month
+        ("на восьмое", NOW, date(2026, 10, 8)),
+        ("на 8-е", NOW, date(2026, 10, 8)),
+        ("8-го встреча с Олей", NOW, date(2026, 10, 8)),
+        ("восьмого октября", NOW, date(2026, 10, 8)),
+        ("на двадцать первое в 10", NOW, date(2026, 10, 21)),
+        ("до тридцатого числа", NOW, date(2026, 10, 30)),
+        ("на 5-е", NOW, date(2026, 11, 5)),  # passed this month: next month's
+        # At night yesterday's date is not rolled to next year or month
+        ("8 октября", NIGHT, date(2026, 10, 8)),
+        ("на восьмое", NIGHT, date(2026, 10, 8)),
+        ("8 октября", datetime(2026, 10, 9, 14, 0, tzinfo=TZ), date(2027, 10, 8)),
+        # Not dates
+        ("5-го класса", NOW, None),
+        ("к первому уроку", NOW, None),
+        ("с первого раза", NOW, None),
+        ("первое, что нужно сделать", NOW, None),
+        ("по второму вопросу", NOW, None),
+    ],
+)
+def test_ordinal_and_night_dates(text, now, expected):
+    assert parse(text, now).date == expected
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [("9", date(2026, 10, 9)), ("8-е", date(2026, 10, 8)), ("восьмое", date(2026, 10, 8)), ("8 числа", date(2026, 10, 8)), ("встреча", None)],
+)
+def test_bare_day_at_night(text, expected):
+    assert bare_day(text, NIGHT) == expected

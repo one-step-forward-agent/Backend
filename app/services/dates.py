@@ -37,6 +37,23 @@ HALF_PAST = {
     "первого": 1, "второго": 2, "третьего": 3, "четвёртого": 4, "четвертого": 4, "пятого": 5, "шестого": 6, "седьмого": 7,
     "восьмого": 8, "девятого": 9, "десятого": 10, "одиннадцатого": 11, "двенадцатого": 12,
 }
+# Until this hour the user's day has not ended yet: at 01:00 "завтра" is ambiguous and yesterday's date is still "today"
+NIGHT_END_HOUR = 5
+ORDINAL_STEMS = {
+    "перв": 1, "втор": 2, "трет": 3, "четв[её]рт": 4, "пят": 5, "шест": 6, "седьм": 7, "восьм": 8, "девят": 9, "десят": 10,
+    "одиннадцат": 11, "двенадцат": 12, "тринадцат": 13, "четырнадцат": 14, "пятнадцат": 15, "шестнадцат": 16,
+    "семнадцат": 17, "восемнадцат": 18, "девятнадцат": 19, "двадцат": 20, "тридцат": 30,
+}
+# "восьмое", "двадцать первого", "третье" — a day of the month said as a word
+ORDINAL_DAY = rf"(?:(двадцать|тридцать)\s+)?({'|'.join(ORDINAL_STEMS)})(?:ое|ого|ому|ым|ье|ьего|ьему|ьим)"
+# "8-е", "8-го", "8ое" — a day of the month said as a number with an ending
+NUMERIC_DAY = r"(\d{1,2})-?(?:е|ое|го|ого|му|ому)"
+# Prepositions after which a bare ordinal is a date: "на восьмое", "с 9-го", "до двадцатого"
+DAY_PREPOSITION = r"(?:на|с|со|до|по|к|ко|от)"
+# "5-го класса", "3-му этажу": an ordinal number that is not a day
+NOT_DAY = r"класс|курс|этаж|подъезд|кабинет|ауд|корпус|раз\b|урок|пар[аеуы]|вопрос|мест|уровн|сезон|серии|глав"
+# A bare ordinal word is a day when the phrase ends after it or a time or another date follows: "на восьмое в 10"
+DAY_FOLLOWERS = r"числ\w*|в\s|во\s|к\s|с\s|на\s|по\s|до\s|и\s|утр|вечер|дн[её]м|ночь|\d"
 # Words after "в 5" that mean the number is not an hour ("в 5 классе", "в 2 раза", "в 15 октября")
 NOT_HOUR = rf"(?:{MONTH_FORMS}|числ|класс|раз|лет|год|человек|недел|дн|день|минут|мин|этаж|кабинет|ауд|корпус|руб|%|[.:/]\d|-?го\b)"
 
@@ -72,6 +89,44 @@ def _month(token: str) -> int:
         if token.startswith(prefix) and not (prefix == "ма" and token.startswith("мар")):
             return index + 1
     raise ValueError(token)
+
+
+def _ordinal(tens: str | None, stem: str) -> int | None:
+    for pattern, value in ORDINAL_STEMS.items():
+        if re.fullmatch(pattern, stem):
+            total = value + (20 if tens == "двадцать" else 30 if tens == "тридцать" else 0)
+            return total if 1 <= total <= 31 and not (tens and value >= 10) else None
+    return None
+
+
+def earliest_day(now: datetime) -> date:
+    """Dates before this one roll forward to the next month or year. At night yesterday's date still counts:
+    at 01:00 on the 9th "8 октября" means the day that has just ended, not next year's."""
+    today = now.date()
+    return today - timedelta(days=1) if now.hour < NIGHT_END_HOUR else today
+
+
+def _month_day(day: int, today: date, earliest: date) -> date | None:
+    """A day of the month without a month: this month's, or next month's when it has passed."""
+    found = _safe_date(today.year, today.month, day)
+    if found and found >= earliest:
+        return found
+    if earliest.month != today.month:
+        found = _safe_date(earliest.year, earliest.month, day)
+        if found and found >= earliest:
+            return found
+    following = today + relativedelta(months=1)
+    return _safe_date(following.year, following.month, day)
+
+
+def bare_day(text: str, now: datetime) -> date | None:
+    """A day said only as a number: "9", "8-е", "восьмое", "9 число" — used where a day is expected (moving tasks)."""
+    low = " ".join(text.lower().split())
+    match = re.fullmatch(rf"(?:{DAY_PREPOSITION}\s+)?(?:(\d{{1,2}})(?:-?(?:е|ое|го|ого|му|ому))?|{ORDINAL_DAY})(?:\s+числ\w*)?", low)
+    if not match:
+        return None
+    day = int(match.group(1)) if match.group(1) else _ordinal(match.group(2), match.group(3))
+    return _month_day(day, now.date(), earliest_day(now)) if day and 1 <= day <= 31 else None
 
 
 def _safe_date(year: int, month: int, day: int) -> date | None:
@@ -170,12 +225,19 @@ def parse_recurrence(text: str) -> tuple[str | None, list[tuple[int, int]]]:
     return None, []
 
 
-def _explicit_date(low: str, today: date) -> tuple[date | None, tuple[int, int] | None]:
+def _explicit_date(low: str, today: date, earliest: date | None = None) -> tuple[date | None, tuple[int, int] | None]:
+    earliest = earliest or today
     if match := re.search(r"\b(\d{4})-(\d{2})-(\d{2})\b", low):
         return _safe_date(int(match.group(1)), int(match.group(2)), int(match.group(3))), match.span()
-    if match := re.search(rf"\b(\d{{1,2}})(?:-?го)?\s+({MONTH_FORMS})\b(?:\s+(\d{{4}})(?:\s*г(?:ода|\.)?)?)?", low):
+    if match := re.search(rf"\b(\d{{1,2}})(?:-?(?:го|ое|е|ого))?\s+({MONTH_FORMS})\b(?:\s+(\d{{4}})(?:\s*г(?:ода|\.)?)?)?", low):
         found = _safe_date(int(match.group(3) or today.year), _month(match.group(2)), int(match.group(1)))
-        if found and not match.group(3) and found < today:
+        if found and not match.group(3) and found < earliest:
+            found = _safe_date(found.year + 1, found.month, found.day)
+        return found, match.span()
+    if match := re.search(rf"\b{ORDINAL_DAY}\s+({MONTH_FORMS})\b(?:\s+(\d{{4}}))?", low):
+        day = _ordinal(match.group(1), match.group(2))
+        found = _safe_date(int(match.group(4) or today.year), _month(match.group(3)), day) if day else None
+        if found and not match.group(4) and found < earliest:
             found = _safe_date(found.year + 1, found.month, found.day)
         return found, match.span()
     for match in re.finditer(r"(?<![\d.:])(\d{1,2})[./](\d{1,2})(?:[./](\d{4}|\d{2}))?(?![\d.:])", low):
@@ -187,16 +249,21 @@ def _explicit_date(low: str, today: date) -> tuple[date | None, tuple[int, int] 
         found = _safe_date(year, int(match.group(2)), int(match.group(1)))
         if not found:
             continue
-        if not match.group(3) and found < today:
+        if not match.group(3) and found < earliest:
             found = _safe_date(found.year + 1, found.month, found.day)
         return found, match.span()
     if match := re.search(r"\b(\d{1,2})(?:-?го)?\s+числа\b", low):
+        return _month_day(int(match.group(1)), today, earliest), match.span()
+    # "на 8-е", "до 15-го", "восьмого числа", "на восьмое"
+    if match := re.search(rf"\b{NUMERIC_DAY}(?!\s*(?:{MONTH_FORMS}|{NOT_DAY}))(?=\W|$)", low):
         day = int(match.group(1))
-        found = _safe_date(today.year, today.month, day)
-        if not found or found < today:
-            following = today + relativedelta(months=1)
-            found = _safe_date(following.year, following.month, day)
-        return found, match.span()
+        if 1 <= day <= 31:
+            return _month_day(day, today, earliest), match.span()
+    # A bare ordinal word is a date only after a preposition or before "числа": "первое, что нужно" is not
+    for match in re.finditer(rf"\b(?:({DAY_PREPOSITION})\s+)?{ORDINAL_DAY}(\s+числ\w*)?\b(?=\s*(?:$|[,.;:!?)]|{DAY_FOLLOWERS}))", low):
+        day = _ordinal(match.group(2), match.group(3))
+        if day and (match.group(1) or match.group(4)):
+            return _month_day(day, today, earliest), match.span()
     return None, None
 
 
@@ -285,7 +352,7 @@ def parse(text: str, now: datetime) -> Parsed:
         result.date, result.end_date = first, last
         result.spans.append(span)
         return result
-    found, span = _explicit_date(low, today)
+    found, span = _explicit_date(low, today, earliest_day(now))
     if found is None:
         if match := re.search(r"\b(?:на\s+)?послезавтра\b", low):
             found, span = today + timedelta(days=2), match.span()

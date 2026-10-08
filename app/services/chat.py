@@ -10,9 +10,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.models.models import AssistantDraft, ConversationMessage, Event, Tag, User
-from app.services import dates, tasks
+from app.services import dates, tasks, usage
 from app.services.events import google_provider, remember_google_token
-from app.services.ru import MONTHS, RELATIVE_DAYS, day_label, plural
+from app.services.ru import MONTHS, RELATIVE_DAYS, WEEKDAYS, day_label, plural
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +22,8 @@ UNDO_WINDOW = timedelta(days=7)
 DRAFT_LIFETIME = timedelta(days=2)
 # A message counts as the new value of a field only shortly after the user tapped "edit"
 EDIT_TIMEOUT = timedelta(minutes=10)
-MAX_DRAFT_ITEMS = 40
+# A move of a whole day can hold many tasks; a draft is never cut silently below this
+MAX_DRAFT_ITEMS = 200
 LOCAL_TEXT_LIMIT = 300
 SEARCH_PAST = timedelta(days=30)
 SEARCH_AHEAD = timedelta(days=365)
@@ -76,6 +77,16 @@ ANALYZE_REQUEST = re.compile(
     re.I,
 )
 ALL_WORDS = re.compile(r"\b(?:все|всё|всех|целиком|полностью|весь)\b", re.I)
+# "их", "эти задачи", "только что добавленные" point at the tasks of the previous answer
+CONTEXT_TARGET = re.compile(
+    r"\b(?:их|них|эти|этих|это|всё\s+это|все\s+это|только\s+что\s+\w+|последн\w*\s+(?:добавленн|созданн)\w*|добавленн\w*|созданн\w*)\b", re.I
+)
+# Moving tasks, wherever the verb stands: "перенеси всё на 8-е", "давай перенесём задачи с 9 на 8"
+MOVE_VERB = re.compile(r"\b(?:перенес\w*|перенест\w*|передвин\w*|подвин\w*|сдвин\w*|отлож\w*)", re.I)
+DAY_ADJECTIVES = {"вчерашн": -1, "сегодняшн": 0, "завтрашн": 1, "послезавтрашн": 2}
+NIGHT_WORDS = re.compile(r"\b(?:после)?завтра\b", re.I)
+# Tasks added one message after another count together for "их": within this time of the latest batch
+CONTEXT_BATCH_WINDOW = timedelta(hours=1)
 # Words that name the action, the calendar itself or nothing in particular — not a task
 ACTION_WORDS = ("удал", "убер", "убра", "стер", "сотр", "очист", "почист", "отмен", "отмет", "помет", "выполн", "сдела", "законч", "заверш", "закр", "можеш", "можно", "пожалуйст", "календар", "dayla")
 NOISE_WORDS = {"больше", "нужны", "нужен", "нужна", "нужно", "надо", "эти", "этих", "эту", "этот", "мой", "мою", "моего", "моих", "свои", "своих", "из", "как", "уже", "ещё", "еще", "дела"}
@@ -249,6 +260,50 @@ async def recent_context(session: AsyncSession, user_id: int) -> str:
 # ---------- agenda and search ----------
 
 
+def searchable(event: Event) -> str:
+    # Titles are encrypted at rest, so words are matched after decryption
+    return " ".join(part for part in (event.title, event.description, event.location) if part).lower().replace("ё", "е")
+
+
+def match_keywords(events: list[Event], keywords: list[str]) -> list[Event]:
+    """Events with every word; when none has all of them, those with the most (at least half),
+    so one extra word in a question does not hide the task."""
+    found = [event for event in events if all(stem in searchable(event) for stem in keywords)]
+    if found or len(keywords) < 2:
+        return found
+    scores = [(sum(stem in searchable(event) for stem in keywords), event) for event in events]
+    best = max((score for score, _ in scores), default=0)
+    if best * 2 < len(keywords) or best == 0:
+        return []
+    return [event for score, event in scores if score == best]
+
+
+def short_day(day: date) -> str:
+    return f"{WEEKDAYS[day.weekday()]}, {day.day} {MONTHS[day.month - 1]}"
+
+
+def night_note(text: str, now: datetime) -> str | None:
+    """After midnight "завтра" is ambiguous: the user may mean the day after sleep, which has already begun.
+    Say which date was taken and how to fix it."""
+    if now.hour >= dates.NIGHT_END_HOUR or not NIGHT_WORDS.search(text):
+        return None
+    today = now.date()
+    after = bool(re.search(r"послезавтра", text, re.I))
+    said = today + timedelta(days=2 if after else 1)
+    meant = said - timedelta(days=1)
+    fix = "на сегодня" if meant == today else "на завтра"
+    word = "Послезавтра" if after else "Завтра"
+    return (
+        f"⚠️ Сейчас {now:%H:%M} — уже {short_day(today)}. «{word}» — это {short_day(said)}. "
+        f"Если вы имели в виду {short_day(meant)}, напишите «перенеси их {fix}»."
+    )
+
+
+def join_text(*parts: str | None) -> str | None:
+    found = [part for part in parts if part]
+    return "\n\n".join(found) if found else None
+
+
 def event_view(event: Event, tz: ZoneInfo, repeats: int = 0) -> dict:
     view = tasks.task_view(event, tz)
     view["repeats"] = repeats
@@ -370,11 +425,7 @@ async def search(session: AsyncSession, user: User, text: str, tz: ZoneInfo) -> 
     conditions = [Event.user_id == user.id, Event.start_at < until, Event.end_at > since]
     events = list(await session.scalars(select(Event).where(*conditions).order_by(Event.start_at).limit(SEARCH_SCAN_LIMIT)))
     if filters["keywords"]:
-        # Titles are encrypted at rest, so keywords are matched after decryption
-        def searchable(event: Event) -> str:
-            return " ".join(part for part in (event.title, event.description, event.location) if part).lower().replace("ё", "е")
-
-        events = [event for event in events if all(stem in searchable(event) for stem in filters["keywords"])]
+        events = match_keywords(events, filters["keywords"])
     events = events[:100]
     if filters["time_from"] or filters["time_to"]:
         events = [
@@ -1008,9 +1059,6 @@ async def find_event(session: AsyncSession, user: User, target: str, tz: ZoneInf
         )
     )
 
-    def searchable(event: Event) -> str:
-        return " ".join(part for part in (event.title, event.description, event.location) if part).lower().replace("ё", "е")
-
     found = [event for event in events if all(stem in searchable(event) for stem in keywords)]
     # The nearest upcoming unfinished occurrence first
     found.sort(key=lambda event: (event.completed_at is not None, event.end_at < now, abs((event.start_at - now).total_seconds())))
@@ -1080,6 +1128,9 @@ def change_item(event: Event, change: dict, tz: ZoneInfo) -> tuple[dict | None, 
 
 async def change_request(session: AsyncSession, user: User, text: str, tz: ZoneInfo, history: str) -> dict | None:
     """A proposal to change an existing event, a message why it cannot be changed, or None when this is not a change."""
+    moved = await move_many(session, user, text, tz)
+    if moved is not None:
+        return moved
     now = datetime.now(tz)
     change = parse_change(text, now)
     event = await find_event(session, user, change["target"], tz) if change else None
@@ -1107,7 +1158,7 @@ async def change_request(session: AsyncSession, user: User, text: str, tz: ZoneI
         return {"kind": "answer", "text": problem}
     note = "Эта задача отмечена как неперемещаемая — точно изменить?" if event.is_fixed and not change.get("title") else None
     draft = await create_draft(session, user, [item])
-    return proposal(draft, tz, answer=f"Изменю «{event.title}» — проверьте и подтвердите:", note=note)
+    return proposal(draft, tz, answer=join_text(night_note(text, now), f"Изменю «{event.title}» — проверьте и подтвердите:"), note=note)
 
 
 def model_change(raw: dict, now: datetime) -> dict | None:
@@ -1231,6 +1282,7 @@ def simple_task(text: str, now: datetime) -> list[dict]:
 
 
 async def handle_message(session: AsyncSession, user: User, text: str) -> dict:
+    usage.current_user_id.set(user.id)
     tz = tasks.local_tz(user)
     text = text.strip()[:50000]
     history = await recent_context(session, user.id)
@@ -1284,10 +1336,13 @@ async def route(session: AsyncSession, user: User, text: str, tz: ZoneInfo, hist
     if items:
         await apply_hashtags(session, user, items, text)
         draft = await create_draft(session, user, items)
-        if ADD_REQUEST.match(text) and len(items) == 1:
+        now = datetime.now(tz)
+        warning = night_note(text, now) if any(item["date"] > now.date().isoformat() for item in items) else None
+        if ADD_REQUEST.match(text) and len(items) == 1 and not warning:
             # The user already said "добавь": add it now; "Отменить" is under the answer
             return await confirm_draft(session, user, draft.id)
-        return proposal(draft, tz, answer=honest(answer))
+        # At night "завтра" is ambiguous: the tasks wait for confirmation with the date spelled out
+        return proposal(draft, tz, answer=join_text(warning, honest(answer)))
     if not answer and settings.gigachat_credentials:
         from services.gigachat import GigaChatClient
 
@@ -1320,11 +1375,18 @@ async def select_events(session: AsyncSession, user: User, text: str, tz: ZoneIn
     """The tasks a request is about: a period ("на завтра", "на этой неделе"), words of a title, or everything ("все").
     Words alone pick the nearest matching task unless "все" is said."""
     now = datetime.now(tz)
+    if CONTEXT_TARGET.search(text):
+        found = await context_events(session, user, text, tz)
+        if found is not None:
+            return found, None
+        text = CONTEXT_TARGET.sub(" ", text)
     filters = local_filters(text, tz) or {"date_from": None, "date_to": None, "time_from": None, "time_to": None, "keywords": []}
-    words = [word for word in re.findall(r"[а-яёa-z0-9]+", dates.strip_spans(text, dates.parse(text, now).spans).lower()) if not word.startswith(ACTION_WORDS) and word not in NOISE_WORDS]
+    words = request_words(text, now)
     keywords = search_keywords(" ".join(words))
-    everything = bool(ALL_WORDS.search(text))
-    date_from = filters["date_from"] or (period_default if not keywords and not everything else None)
+    # "все встречи с Олей", "удали созвоны" — every matching task, not only the nearest one
+    everything = bool(ALL_WORDS.search(text)) or (bool(keywords) and plural_head(words))
+    # Without words "отметь всё выполненным" is about today, never about every task ever
+    date_from = filters["date_from"] or (period_default if not keywords else None)
     conditions = [Event.user_id == user.id]
     label = None
     if date_from:
@@ -1337,10 +1399,6 @@ async def select_events(session: AsyncSession, user: User, text: str, tz: ZoneIn
         return [], None
     events = list(await session.scalars(select(Event).where(*conditions).order_by(Event.start_at).limit(MAX_DELETE)))
     if keywords:
-
-        def searchable(event: Event) -> str:
-            return " ".join(part for part in (event.title, event.description, event.location) if part).lower().replace("ё", "е")
-
         events = [event for event in events if all(stem in searchable(event) for stem in keywords)]
         if not everything and not date_from and events:
             events.sort(key=lambda event: (event.completed_at is not None, event.end_at < now, abs((event.start_at - now).total_seconds())))
@@ -1428,7 +1486,7 @@ async def analyze_request(session: AsyncSession, user: User, text: str, tz: Zone
         scope = "week"
     if scope == "today":
         first = last = today
-        data = await insights.facts(session, user, now)
+        data = await insights.facts(session, user, now, ahead=False)
         rules = insights.rule_recommendations(data)
     else:
         first, last = insights.period_bounds(scope, anchor)
@@ -1486,3 +1544,210 @@ async def undo(session: AsyncSession, user: User, event_ids: list[int]) -> int:
         await session.delete(event)
     await session.commit()
     return len(events)
+
+
+# ---------- the previous answer as context, and moving many tasks at once ----------
+
+
+def request_words(text: str, now: datetime) -> list[str]:
+    """Words that may name a task: without dates, action verbs and filler."""
+    plain = dates.strip_spans(text, dates.parse(text, now).spans).lower()
+    return [word for word in re.findall(r"[а-яёa-z0-9]+", plain) if not word.startswith(ACTION_WORDS) and word not in NOISE_WORDS]
+
+
+def plural_head(words: list[str]) -> bool:
+    """«встречи с Олей», «созвоны», «тренировки» name every matching task; «встречу» names one."""
+    head = next((word for word in words if len(word) >= 4 and not ALL_WORDS.fullmatch(word)), "")
+    return len(head) >= 5 and head.endswith(("ы", "и"))
+
+
+def reply_event_ids(reply: dict) -> list[int]:
+    kind = reply.get("kind")
+    if kind in ("created", "completed") and reply.get("event_ids"):
+        values = reply["event_ids"]
+    elif kind in ("created", "updated", "completed", "proposal", "delete_proposal"):
+        values = [event.get("id") or event.get("event_id") for event in reply.get("events") or [] if isinstance(event, dict)]
+    elif kind == "agenda":
+        values = [event.get("id") for day in reply.get("days") or [] for event in day.get("events") or [] if isinstance(event, dict)]
+    else:
+        values = []
+    return [value for value in values if isinstance(value, int) and not isinstance(value, bool)]
+
+
+async def recent_event_ids(session: AsyncSession, user: User) -> list[int]:
+    """The tasks the previous answer was about. Tasks added in several messages in a row count together,
+    so "перенеси их на сегодня" moves all of them, not only the last batch."""
+    rows = list(
+        await session.scalars(
+            select(ConversationMessage)
+            .where(ConversationMessage.user_id == user.id, ConversationMessage.role == "assistant")
+            .order_by(ConversationMessage.created_at.desc(), ConversationMessage.id.desc())
+            .limit(20)
+        )
+    )
+    found: list[int] = []
+    latest = None
+    for row in rows:
+        reply = row.reply or {}
+        ids = reply_event_ids(reply)
+        if latest is None:
+            if not ids:
+                continue
+            latest = row
+            found = ids
+            if reply.get("kind") != "created":
+                break
+            continue
+        if reply.get("kind") != "created" or latest.created_at - row.created_at > CONTEXT_BATCH_WINDOW:
+            break
+        found += [value for value in ids if value not in found]
+    return found
+
+
+async def context_events(session: AsyncSession, user: User, text: str, tz: ZoneInfo) -> list[Event] | None:
+    """The tasks "их" or "эти" point at, narrowed by words or a date the request adds;
+    None when the previous answer showed no tasks or none of them fits."""
+    ids = await recent_event_ids(session, user)
+    if not ids:
+        return None
+    events = list(await session.scalars(select(Event).where(Event.user_id == user.id, Event.id.in_(ids[:MAX_DELETE])).order_by(Event.start_at)))
+    now = datetime.now(tz)
+    rest = CONTEXT_TARGET.sub(" ", text)
+    day = dates.parse(rest, now).date
+    if day:
+        events = [event for event in events if event.start_at.astimezone(tz).date() == day]
+    keywords = search_keywords(" ".join(request_words(rest, now)))
+    if keywords:
+        events = [event for event in events if all(stem in searchable(event) for stem in keywords)]
+    return events or None
+
+
+async def open_draft(session: AsyncSession, user: User) -> AssistantDraft | None:
+    """The unconfirmed list of new tasks the previous answer offered — "их" may point at it."""
+    last = await session.scalar(
+        select(ConversationMessage)
+        .where(ConversationMessage.user_id == user.id, ConversationMessage.role == "assistant")
+        .order_by(ConversationMessage.created_at.desc(), ConversationMessage.id.desc())
+        .limit(1)
+    )
+    if not last or not last.draft_id:
+        return None
+    draft = await session.get(AssistantDraft, last.draft_id)
+    if not draft or draft.user_id != user.id or not draft.items or any(item.get("action") or item.get("event_id") for item in draft.items):
+        return None
+    return draft
+
+
+def move_target(body: str, now: datetime) -> tuple[str, date] | None:
+    """Split "все задачи с 9 на 8" into the source part and the new day; a bare number after "на" is a day here."""
+    for split in reversed(list(re.finditer(r"(?:^|\s)на\s+", body))):
+        value = body[split.end():].strip(" ,.!?")
+        parsed = dates.parse(value, now)
+        day = dates.bare_day(value, now) or (parsed.date if parsed.date and parsed.time is None else None)
+        if day:
+            return body[: split.start()], day
+    return None
+
+
+def move_source(source: str, now: datetime) -> tuple[date | None, str]:
+    """The day the tasks are on now ("с 9", "с завтра", "задачи на завтра", "сегодняшние") and the rest of the phrase."""
+    if match := re.search(r"(?:^|\s)(?:с|со)\s+(.+)$", source):
+        value = match.group(1)
+        parsed = dates.parse(value, now)
+        day = dates.bare_day(value, now) or parsed.date
+        if day:
+            return day, source[: match.start()]
+    for stem, offset in DAY_ADJECTIVES.items():
+        if match := re.search(rf"\b{stem}\w*", source, re.I):
+            return now.date() + timedelta(days=offset), source[: match.start()] + source[match.end():]
+    parsed = dates.parse(source, now)
+    if parsed.date:
+        return parsed.date, dates.strip_spans(source, parsed.spans)
+    return None, source
+
+
+async def move_draft(session: AsyncSession, user: User, draft: AssistantDraft, day: date, tz: ZoneInfo) -> dict:
+    """Move every new task of an unconfirmed draft to another day before it is added."""
+    items = []
+    for item in draft.items:
+        old = date.fromisoformat(item["date"])
+        moved = dict(item)
+        if not item.get("rrule"):
+            moved["date"] = day.isoformat()
+            if item.get("end_date"):
+                moved["end_date"] = (date.fromisoformat(item["end_date"]) + (day - old)).isoformat()
+        items.append(moved)
+    draft.items = items
+    draft.awaiting = None
+    reply = proposal(draft, tz, note=f"Перенесла на {short_day(day)} ✓")
+    await update_draft_messages(session, user, draft.id, reply)
+    await session.commit()
+    return reply
+
+
+async def move_many(session: AsyncSession, user: User, text: str, tz: ZoneInfo) -> dict | None:
+    """Moving several tasks to another day: "перенеси всё на 8-е", "перенеси задачи с 9 на 8",
+    "перенеси их на сегодня", "перенеси все встречи с Олей на пятницу". Every task gets the new day and keeps
+    its time; nothing changes until the user confirms. None when the request is about one task."""
+    verb = MOVE_VERB.search(text)
+    if not verb or len(text) > LOCAL_TEXT_LIMIT:
+        return None
+    now = datetime.now(tz)
+    target = move_target(text[verb.end():].strip(" ,.!?"), now)
+    if not target:
+        return None
+    source, day = target
+    source_day, phrase = move_source(source, now)
+    context = bool(CONTEXT_TARGET.search(phrase))
+    everything = bool(ALL_WORDS.search(phrase))
+    words = request_words(ALL_WORDS.sub(" ", CONTEXT_TARGET.sub(" ", phrase)), now)
+    keywords = search_keywords(" ".join(words))
+    many = bool(keywords) and plural_head(words)
+    # "перенеси встречу с 9 на 10" stays a change of one task
+    if not (context or everything or many or (source_day and not keywords)):
+        return None
+    if (context or everything) and not keywords and not source_day:
+        draft = await open_draft(session, user)
+        if draft:
+            return await move_draft(session, user, draft, day, tz)
+    if source_day:
+        events = await tasks.events_between(session, user, datetime.combine(source_day, time.min, tz), datetime.combine(source_day + timedelta(days=1), time.min, tz), limit=MAX_DELETE)
+        events = [event for event in events if event.start_at.astimezone(tz).date() == source_day]
+        if keywords:
+            events = [event for event in events if all(stem in searchable(event) for stem in keywords)]
+    elif context or (everything and not keywords):
+        found = await context_events(session, user, phrase, tz)
+        if found is None:
+            return {"kind": "answer", "text": "С какого дня перенести? Например: «перенеси все задачи с 9 на 8 октября» или «перенеси задачи на завтра на пятницу»."}
+        if everything and not context:
+            # "перенеси всё на 8-е" after adding tasks: every task of the days they are on
+            days = sorted({event.start_at.astimezone(tz).date() for event in found})
+            events = []
+            for found_day in days:
+                start = datetime.combine(found_day, time.min, tz)
+                events += [event for event in await tasks.events_between(session, user, start, start + timedelta(days=1), limit=MAX_DELETE) if event.start_at.astimezone(tz).date() == found_day]
+            source_day = days[0] if len(days) == 1 else None
+        else:
+            events = found
+    else:
+        candidates = list(
+            await session.scalars(
+                select(Event).where(Event.user_id == user.id, Event.start_at < now + SEARCH_AHEAD, Event.end_at > now - timedelta(days=1)).order_by(Event.start_at).limit(SEARCH_SCAN_LIMIT)
+            )
+        )
+        events = [event for event in candidates if all(stem in searchable(event) for stem in keywords)]
+    events = list({event.id: event for event in events if event.completed_at is None}.values())
+    if not events:
+        where = f" на {short_day(source_day)}" if source_day else ""
+        return {"kind": "not_found", "text": f"Не нашла невыполненных задач{where}, которые можно перенести. Уточните, например: «перенеси все задачи с 9 на 8 октября»."}
+    items = [item for item in (change_item(event, {"date": day}, tz)[0] for event in events[:MAX_DRAFT_ITEMS]) if item]
+    if not items:
+        return {"kind": "answer", "text": f"Эти задачи уже стоят на {short_day(day)}."}
+    draft = await create_draft(session, user, items)
+    count = len(items)
+    origin = f" с {short_day(source_day)}" if source_day else ""
+    answer = f"Перенесу {count} {plural(count, 'задачу', 'задачи', 'задач')}{origin} на {short_day(day)} — время сохранится. Проверьте и сохраните:"
+    if len(events) > MAX_DRAFT_ITEMS:
+        answer += f"\nЗадач больше {MAX_DRAFT_ITEMS}: здесь первые {MAX_DRAFT_ITEMS}, остальные перенесите следующим сообщением."
+    note = "Среди них есть неперемещаемые задачи — проверьте." if any(event.is_fixed for event in events[:MAX_DRAFT_ITEMS]) else None
+    return proposal(draft, tz, answer=join_text(night_note(text, now), answer), note=note)

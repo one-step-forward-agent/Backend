@@ -18,12 +18,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core import ratelimit
 from app.core.config import settings
 from app.models.models import Event, RecommendationCache, User
-from app.services import tasks
+from app.services import dates, tasks, usage
 from app.services.ru import MONTHS, MONTHS_NOMINATIVE, WEEKDAYS_SHORT, plural
 
 logger = logging.getLogger(__name__)
 
 DAY_NAMES = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
+DEFAULT_DAY_START = time(8, 0)
 DEFAULT_DAY_END = time(21, 0)
 BUSY_TASK_COUNT = 6
 OVERDUE_DAYS = 7
@@ -170,17 +171,41 @@ def free_windows(events: list[Event], now: datetime, end: datetime, minimum: int
     return windows
 
 
-async def facts(session: AsyncSession, user: User, now: datetime) -> dict:
+def day_start(profile: dict, day: date) -> time:
+    profile = profile if isinstance(profile, dict) else {}
+    per_day = profile.get("perDayWorkHours") or {}
+    hours = per_day.get(DAY_NAMES[day.weekday()]) if isinstance(per_day, dict) else None
+    start = _clock((hours or {}).get("from")) if isinstance(hours, dict) else None
+    start = start or _clock(profile.get("workHoursFrom"))
+    return start if start and day.weekday() in work_days(profile) else DEFAULT_DAY_START
+
+
+def planning_moment(profile: dict, now: datetime) -> datetime:
+    """The moment advice is given for. After the working day ends it is tomorrow's start: at 23:00 "only
+    0 minutes left, move tasks to tomorrow" helps nobody. At night it is the start of the day that has begun."""
+    today = now.date()
+    if now.hour < dates.NIGHT_END_HOUR:
+        return max(now, datetime.combine(today, day_start(profile, today), now.tzinfo))
+    if now.time() >= day_end(profile, today):
+        tomorrow = today + timedelta(days=1)
+        return datetime.combine(tomorrow, day_start(profile, tomorrow), now.tzinfo)
+    return now
+
+
+async def facts(session: AsyncSession, user: User, now: datetime, ahead: bool = True) -> dict:
     tz = now.tzinfo
+    real_today = now.date()
+    profile = user.profile or {}
+    now = planning_moment(profile, now) if ahead else now
     today = now.date()
     events = await tasks.events_between(session, user, datetime.combine(today, time.min, tz), datetime.combine(today + timedelta(days=1), time.min, tz))
-    past = await tasks.events_between(session, user, datetime.combine(today - timedelta(days=OVERDUE_DAYS), time.min, tz), datetime.combine(today, time.min, tz))
+    past = await tasks.events_between(session, user, datetime.combine(real_today - timedelta(days=OVERDUE_DAYS), time.min, tz), datetime.combine(real_today, time.min, tz))
     stats = await tasks.daily_stats(session, user, 7)
-    profile = user.profile or {}
     end = datetime.combine(today, day_end(profile, today), tz)
     remaining = [event for event in events if event.completed_at is None and (event.all_day or event.end_at > now)]
     windows = free_windows(events, now, end)
     return {
+        "day": "завтра" if today > real_today else "сегодня",
         "deadlines": await deadline_texts(session, user, now, today + timedelta(days=DEADLINE_SOON_DAYS)),
         "fixed_today": [event.title for event in remaining if tasks.is_fixed(event)][:5],
         "now": now.strftime("%H:%M"),
@@ -191,7 +216,7 @@ async def facts(session: AsyncSession, user: User, now: datetime) -> dict:
         "untimed": [event.title for event in remaining if event.all_day][:5],
         "load_minutes": load_minutes(remaining, now),
         "free_windows": [f"{start:%H:%M}–{finish:%H:%M}" for start, finish in windows[:3]],
-        "overdue": [event.title for event in past if tasks.is_overdue(event, today, tz)][:5],
+        "overdue": [event.title for event in past if tasks.is_overdue(event, real_today, tz)][:5],
         "week_percent": stats["percent"],
         "week_total": stats["total"],
         "streak": stats["streak"],
@@ -234,16 +259,17 @@ def rule_recommendations(data: dict) -> list[dict]:
         found.append({"kind": "info", "title": "Есть свободное окно", "text": f"{data['free_windows'][0]} — подходящее время для «{data['untimed'][0]}»."})
     available = max(0, (int(data["day_end"][:2]) * 60 + int(data["day_end"][3:])) - (int(data["now"][:2]) * 60 + int(data["now"][3:])))
     if data["load_minutes"] > available and data["remaining_titles"]:
-        found.append({"kind": "warning", "title": "Плотный день", "text": "Задач больше, чем времени до конца дня. Часть можно перенести на завтра."})
+        found.append({"kind": "warning", "title": "Плотный день", "text": f"Задач на {data.get('day', 'сегодня')} больше, чем рабочего времени. Часть можно перенести на другой день."})
     if data["week_total"] and data["week_percent"] < 50:
         found.append({"kind": "info", "title": "Меньше задач — больше результата", "text": f"За неделю выполнено {data['week_percent']}% задач. Попробуйте планировать 3–5 главных дел в день."})
     if data["streak"] >= 2:
         found.append({"kind": "success", "title": f"Серия {data['streak']} дн.", "text": "Все задачи выполнены несколько дней подряд — так держать!"})
     if not found:
+        day = data.get("day", "сегодня")
         if data["today_total"] == 0:
-            found.append({"kind": "info", "title": "День пока свободен", "text": "Напишите в чат планы на сегодня — я разложу их по времени."})
+            found.append({"kind": "info", "title": "День пока свободен", "text": f"Напишите в чат планы на {day} — я разложу их по времени."})
         else:
-            found.append({"kind": "success", "title": "План под контролем", "text": "Нагрузка на сегодня в норме. Не забудьте отмечать выполненные задачи."})
+            found.append({"kind": "success", "title": "План под контролем", "text": f"Нагрузка на {day} в норме. Не забудьте отмечать выполненные задачи."})
     return found[:2]
 
 
@@ -279,10 +305,12 @@ async def recommendations(session: AsyncSession, user: User, scope: str = "today
         data = await period_facts(session, user, now, first, last, scope)
         return await _cached(session, user, f"{scope}:{first.isoformat()}", plan_cache_key(now, data), data, plan_rules, "plan_recommendations")
     data = await facts(session, user, now)
+    # The key follows the day the advice is about: tomorrow's tasks in the evening
+    moment = planning_moment(user.profile or {}, now)
     today_events = await tasks.events_between(
-        session, user, datetime.combine(now.date(), time.min, now.tzinfo), datetime.combine(now.date() + timedelta(days=1), time.min, now.tzinfo)
+        session, user, datetime.combine(moment.date(), time.min, now.tzinfo), datetime.combine(moment.date() + timedelta(days=1), time.min, now.tzinfo)
     )
-    return await _cached(session, user, "today", cache_key(user, now, today_events, data), data, rule_recommendations, "recommendations")
+    return await _cached(session, user, "today", cache_key(user, moment, today_events, data), data, rule_recommendations, "recommendations")
 
 
 async def _cached(session: AsyncSession, user: User, scope: str, key: str, data: dict, rules, method: str) -> list[dict]:
@@ -294,6 +322,7 @@ async def _cached(session: AsyncSession, user: User, scope: str, key: str, data:
     key_name = f"recommendations:{user.id}"
     if settings.gigachat_credentials and not ratelimit.is_limited(key_name, RECOMMENDATION_CALLS, 3600):
         ratelimit.record(key_name)
+        usage.current_user_id.set(user.id)
         from services.gigachat import GigaChatClient
 
         try:

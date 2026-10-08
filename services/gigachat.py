@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 import aiohttp
 
 from app.core.config import settings
+from app.services import usage
 
 logger = logging.getLogger(__name__)
 
@@ -159,6 +160,15 @@ class GigaChatClient:
             logger.info("GigaChat access token received")
             return await response.json()
 
+    async def _chat(self, session: aiohttp.ClientSession, headers: dict, payload: dict, purpose: str) -> dict:
+        """One chat completion; its token usage is stored in llm_usage under `purpose`."""
+        started = time.monotonic()
+        async with session.post(self.chat_url, headers=headers, json=payload, ssl=_ssl_context()) as response:
+            response.raise_for_status()
+            result = await response.json()
+        await usage.record(purpose, result.get("model") or payload.get("model"), result.get("usage"), int((time.monotonic() - started) * 1000))
+        return result
+
     async def process_message(
         self,
         text: str,
@@ -237,11 +247,7 @@ class GigaChatClient:
                 "temperature": 0.1,
                 "max_tokens": 6000,
             }
-            async with session.post(
-                self.chat_url, headers=headers, json=payload, ssl=_ssl_context()
-            ) as response:
-                response.raise_for_status()
-                result = await response.json()
+            result = await self._chat(session, headers, payload, "process_message")
         logger.info("GigaChat response received, input length: %d", len(text))
         content = result["choices"][0]["message"]["content"]
         parsed = parse_message_response(content)
@@ -270,11 +276,7 @@ class GigaChatClient:
                 "temperature": 0,
                 "max_tokens": 180,
             }
-            async with session.post(
-                self.chat_url, headers=headers, json=payload, ssl=_ssl_context()
-            ) as response:
-                response.raise_for_status()
-                result = await response.json()
+            result = await self._chat(session, headers, payload, "extract_search_filters")
         return parse_search_filters_response(result["choices"][0]["message"]["content"])
 
     async def chat_reply(
@@ -312,11 +314,7 @@ class GigaChatClient:
                 "temperature": 0.5,
                 "max_tokens": 600,
             }
-            async with session.post(
-                self.chat_url, headers=headers, json=payload, ssl=_ssl_context()
-            ) as response:
-                response.raise_for_status()
-                result = await response.json()
+            result = await self._chat(session, headers, payload, "chat_reply")
         return result["choices"][0]["message"]["content"].strip()
 
     async def extract_change(self, text: str, timezone: str = "Europe/Moscow", context: str = "") -> dict:
@@ -347,9 +345,7 @@ class GigaChatClient:
                 "temperature": 0,
                 "max_tokens": 300,
             }
-            async with session.post(self.chat_url, headers=headers, json=payload, ssl=_ssl_context()) as response:
-                response.raise_for_status()
-                result = await response.json()
+            result = await self._chat(session, headers, payload, "extract_change")
         return parse_search_filters_response(result["choices"][0]["message"]["content"])
 
     async def analysis(self, facts: dict, request: str) -> str:
@@ -379,9 +375,7 @@ class GigaChatClient:
                 "temperature": 0.3,
                 "max_tokens": 700,
             }
-            async with session.post(self.chat_url, headers=headers, json=payload, ssl=_ssl_context()) as response:
-                response.raise_for_status()
-                result = await response.json()
+            result = await self._chat(session, headers, payload, "analysis")
         return result["choices"][0]["message"]["content"].strip()
 
     async def extract_events(self, text: str, timezone: str = "Europe/Moscow") -> list[dict]:
@@ -397,7 +391,7 @@ class GigaChatClient:
         prompt = (
             PERSONA
             + "По фактам о дне пользователя дай ровно 2 рекомендации, "
-            f"{tone}. Каждая — конкретная и полезная сегодня: перенести задачу, занять свободное окно задачей без времени, "
+            f"{tone}. Рекомендации — про день из поля day (сегодня или завтра). Каждая — конкретная и полезная на этот день: перенести задачу, занять свободное окно задачей без времени, "
             "разгрузить плотный день, вернуться к целям пользователя. Не выдумывай задач, которых нет в фактах. "
             "Верни только JSON-массив без markdown: [{\"kind\": \"info\" | \"warning\" | \"success\", "
             "\"title\": до 4 слов, \"text\": до 160 символов}].\n"
@@ -412,9 +406,7 @@ class GigaChatClient:
                 "temperature": 0.4,
                 "max_tokens": 400,
             }
-            async with session.post(self.chat_url, headers=headers, json=payload, ssl=_ssl_context()) as response:
-                response.raise_for_status()
-                result = await response.json()
+            result = await self._chat(session, headers, payload, "recommendations")
         return clean_recommendations(result["choices"][0]["message"]["content"], 2)
 
     async def plan_recommendations(self, facts: dict) -> list[dict]:
@@ -443,9 +435,7 @@ class GigaChatClient:
                 "temperature": 0.3,
                 "max_tokens": 600,
             }
-            async with session.post(self.chat_url, headers=headers, json=payload, ssl=_ssl_context()) as response:
-                response.raise_for_status()
-                result = await response.json()
+            result = await self._chat(session, headers, payload, "plan_recommendations")
         return clean_recommendations(result["choices"][0]["message"]["content"], 3)
 
 

@@ -284,3 +284,23 @@ class RecommendationCache(Base):
     key: Mapped[str] = mapped_column(String(64))
     items: Mapped[list[dict]] = mapped_column(EncryptedJSON("recommendation_cache.items"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class LlmUsage(Base):
+    """Tokens spent on one language model request: who asked, for what and how much (see app.services.usage)."""
+
+    __tablename__ = "llm_usage"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    # None for requests made outside a user's session
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), index=True)
+    # The client method: "process_message", "chat_reply", "extract_change", "recommendations", ...
+    purpose: Mapped[str] = mapped_column(String(64), index=True)
+    model: Mapped[str] = mapped_column(String(64))
+    prompt_tokens: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    completion_tokens: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # Prompt tokens served from the provider's cache (cheaper); part of prompt_tokens
+    precached_prompt_tokens: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    total_tokens: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    duration_ms: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)

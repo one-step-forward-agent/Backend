@@ -315,7 +315,13 @@ async def test_recommendations_are_cached_until_the_plan_changes(client, user, m
     first = (await client.get("/api/recommendations", headers=headers)).json()["items"]
     again = (await client.get("/api/recommendations", headers=headers)).json()["items"]
     assert first == again and len(calls) == 1
-    reply = await bot_chat(client, chat_id, "отправить посылку сегодня")
+    # Advice is about the day being planned: tomorrow in the evening, so the new task goes there
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    now = datetime.now(ZoneInfo("Europe/Moscow"))
+    day = "завтра" if insights.planning_moment({}, now).date() > now.date() else "сегодня"
+    reply = await bot_chat(client, chat_id, f"отправить посылку {day}")
     await client.post(f"/internal/bot/chat/{chat_id}/drafts/{reply['draft_id']}/confirm", headers=BOT_HEADERS)
     changed = (await client.get("/api/recommendations", headers=headers)).json()["items"]
     assert len(calls) == 2 and changed[0]["title"] == "Совет 2"
