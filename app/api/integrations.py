@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.auth import google_authorization_url, yandex_authorization_url, notion_authorization_url, jira_authorization_url
+from app.api.auth import first_sync, google_authorization_url, yandex_authorization_url, notion_authorization_url, jira_authorization_url
 from app.api.deps import get_current_user
 from app.core.crypto import decrypt_json, encrypt_json
 from app.core.database import get_session
@@ -77,6 +77,8 @@ async def connect_integration(slug: str, payload: IntegrationConnect, user: User
     integration.status = "connected"
     integration.last_sync_error = None
     await session.commit()
+    # Like after OAuth: events appear without pressing "Синхронизировать"
+    await first_sync(session, user, integration)
     await session.refresh(integration)
     return IntegrationRead.model_validate(integration)
 

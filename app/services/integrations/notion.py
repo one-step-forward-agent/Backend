@@ -62,7 +62,11 @@ class NotionIntegration(IntegrationProvider):
         if response.status_code == 404:
             raise IntegrationError("База не найдена — откройте её в Notion → ··· → Connections и добавьте Dayla")
         if response.is_error:
-            raise IntegrationError(f"Notion: {response.json().get('message', response.status_code)}")
+            try:
+                message = response.json().get("message")
+            except ValueError:
+                message = None
+            raise IntegrationError(f"Notion: {message or response.status_code}")
         return response.json()
 
     def _date_property(self, properties: dict) -> str | None:

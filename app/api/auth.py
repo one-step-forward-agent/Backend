@@ -558,27 +558,13 @@ async def notion_callback(
         raise HTTPException(status_code=400, detail="Notion rejected the authorization code")
     token_data = token_response.json()
 
-    # 2. Забираем профиль бота и workspace.
-    async with httpx.AsyncClient(timeout=15) as client:
-        profile_response = await client.get(
-            "https://api.notion.com/v1/users/me",
-            headers={
-                "Authorization": f"Bearer {token_data['access_token']}",
-                "Notion-Version": NOTION_VERSION,
-            },
-        )
-    if profile_response.is_error:
-        raise HTTPException(status_code=400, detail="Failed to fetch Notion user profile")
-    profile = profile_response.json()
-
-    # email может отсутствовать, если у бота нет person-владельца.
-    # Тогда используем имя воркспейса или bot_id как account_email.
-    person = profile.get("person") or {}
-    email = person.get("email")
+    # 2. The token response names the workspace and the person who connected it; the email is only a label,
+    #    and there is none when the integration is owned by the workspace itself.
+    owner = (token_data.get("owner") or {}).get("user") or {}
+    email = (owner.get("person") or {}).get("email")
     if not email:
-        bot = profile.get("bot") or {}
-        workspace = bot.get("workspace_name") or "Notion Workspace"
-        email = f"{workspace} ({profile.get('id', 'unknown')})"
+        workspace = token_data.get("workspace_name") or "Notion Workspace"
+        email = f"{workspace} ({token_data.get('bot_id', 'unknown')})"
 
     # 3. Сохраняем интеграцию.
     user = await session.get(User, user_id)
@@ -684,9 +670,8 @@ async def jira_callback(
             "https://api.atlassian.com/me",
             headers={"Authorization": f"Bearer {token_data['access_token']}"},
         )
-    if profile_response.is_error:
-        raise HTTPException(status_code=400, detail="Failed to fetch Atlassian user profile")
-    profile = profile_response.json()
+    # The email only labels the account: without it the site name does
+    profile = {} if profile_response.is_error else profile_response.json()
     email = profile.get("email")
     if not email:
         email = f"{site_name} ({cloud_id})"

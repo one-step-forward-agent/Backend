@@ -25,6 +25,7 @@ class FakeServices:
     def __init__(self):
         self.calls: list[tuple[str, str]] = []
         self.created: dict[str, list] = {"google": [], "notion": [], "apple": []}
+        self.atlassian_profile = True
         self.jira_token = "j-1"
 
     def handle(self, request: httpx.Request) -> httpx.Response:
@@ -47,7 +48,7 @@ class FakeServices:
         # Notion
         if url == "https://api.notion.com/v1/oauth/token":
             assert request.headers["Authorization"] == "Basic " + base64.b64encode(b"n-client:n-secret").decode()
-            return httpx.Response(200, json={"access_token": "n-1", "bot_id": "bot-1"})
+            return httpx.Response(200, json={"access_token": "n-1", "bot_id": "bot-1", "workspace_name": "Olga WS", "owner": {"type": "user", "user": {"person": {"email": "olga@notion.so"}}}})
         if url.startswith("https://api.notion.com/"):
             assert request.headers["Authorization"] == "Bearer n-1"
             if url.endswith("/v1/users/me"):
@@ -76,7 +77,7 @@ class FakeServices:
         if url == "https://api.atlassian.com/oauth/token/accessible-resources":
             return httpx.Response(200, json=[{"id": "cloud-1", "url": "https://olga.atlassian.net", "name": "Olga"}])
         if url == "https://api.atlassian.com/me":
-            return httpx.Response(200, json={"email": "olga@corp.com"})
+            return httpx.Response(200, json={"email": "olga@corp.com"}) if self.atlassian_profile else httpx.Response(403)
         if url.startswith("https://api.atlassian.com/ex/jira/cloud-1/"):
             if request.headers["Authorization"] != f"Bearer {self.jira_token}":
                 return httpx.Response(401, json={"message": "expired"})
@@ -187,6 +188,7 @@ async def test_notion(client, user, services):
     headers, _ = user
     await oauth_connect(client, headers, "notion")
     assert await titles(client, headers) == ["Сдать отчёт"]
+    assert (await connection(client, headers, "notion"))["account_email"] == "olga@notion.so"
     assert (await client.post("/api/integrations/notion/test", headers=headers)).json() == {"status": "ok", "account": "База «Задачи»"}
     assert (await client.post("/api/integrations/notion/sync", headers=headers)).json()["created"] == 0
     reply = (await client.post("/api/assistant/chat", json={"text": "позвонить маме послезавтра"}, headers=headers)).json()
@@ -209,14 +211,24 @@ async def test_jira_with_token_refresh(client, user, services):
     assert await titles(client, headers) == ["[FD-7] Починить вход"]
 
 
+async def test_jira_without_profile(client, user, services):
+    # The profile only labels the account: the site name does when Atlassian refuses it
+    headers, _ = user
+    services.atlassian_profile = False
+    await oauth_connect(client, headers, "jira")
+    assert (await connection(client, headers, "jira"))["account_email"] == "Olga (cloud-1)"
+    assert await titles(client, headers) == ["[FD-7] Починить вход"]
+
+
 async def test_apple_with_app_password(client, user, services):
     headers, _ = user
     wrong = await client.post("/api/integrations/apple/connect", json={"values": {"username": "olga@icloud.com", "app_password": "wrong"}}, headers=headers)
     assert wrong.status_code == 400 and "пароль приложения" in wrong.json()["detail"]
     connected = await client.post("/api/integrations/apple/connect", json={"values": {"username": "olga@icloud.com", "app_password": "app-pass"}}, headers=headers)
     assert connected.status_code == 200, connected.text
-    assert (await client.post("/api/integrations/apple/sync", headers=headers)).json()["created"] == 1
+    # The first sync ran right after connecting
     assert await titles(client, headers) == ["Ужин с семьёй"]
+    assert (await client.post("/api/integrations/apple/sync", headers=headers)).json()["created"] == 0
     reply = (await client.post("/api/assistant/chat", json={"text": "позвонить маме послезавтра"}, headers=headers)).json()
     event_id = (await client.post(f"/api/assistant/drafts/{reply['draft_id']}/confirm", headers=headers)).json()["event_ids"][0]
     assert (await client.post(f"/api/integrations/apple/export/{event_id}", headers=headers)).status_code == 201
