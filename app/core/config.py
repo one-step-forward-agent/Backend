@@ -45,6 +45,26 @@ class Settings:
     google_redirect_uri: str = os.getenv(
         "GOOGLE_REDIRECT_URI", "http://localhost:8000/auth/google/callback"
     )
+    yandex_client_id: str | None = os.getenv("YANDEX_CLIENT_ID")
+    yandex_client_secret: str | None = os.getenv("YANDEX_CLIENT_SECRET")
+    yandex_redirect_uri: str | None = os.getenv("YANDEX_REDIRECT_URI")
+
+    apple_client_id: str | None = os.getenv("APPLE_CLIENT_ID")
+    apple_client_secret: str | None = os.getenv("APPLE_CLIENT_SECRET")
+    apple_redirect_uri: str | None = os.getenv("APPLE_REDIRECT_URI")
+
+    jira_client_id: str | None = os.getenv("JIRA_CLIENT_ID")
+    jira_client_secret: str | None = os.getenv("JIRA_CLIENT_SECRET")
+    jira_redirect_uri: str | None = os.getenv("JIRA_REDIRECT_URI")
+
+    notion_client_id: str | None = os.getenv("NOTION_CLIENT_ID")
+    notion_client_secret: str | None = os.getenv("NOTION_CLIENT_SECRET")
+    notion_redirect_uri: str | None = os.getenv("NOTION_REDIRECT_URI")
+
+    obsidian_client_id: str | None = os.getenv("OBSIDIAN_CLIENT_ID")
+    obsidian_client_secret: str | None = os.getenv("OBSIDIAN_CLIENT_SECRET")
+    obsidian_redirect_uri: str | None = os.getenv("OBSIDIAN_REDIRECT_URI")
+
     gigachat_credentials: str = os.getenv("SBER_AUTHORIZATION_KEY", "")
     gigachat_scope: str = os.getenv("SBER_SCOPE", "GIGACHAT_API_PERS")
     gigachat_model: str = os.getenv("GIGACHAT_MODEL", "GigaChat")

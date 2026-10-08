@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.api import integrations, internal, reminders
-from app.api.auth import auth_router, session_router
+from app.api.auth import google_router, yandex_router, apple_router, notion_router, jira_router, obsidian_router,  session_router
 from app.api.routes import router
 from app.core.config import settings
 from app.core.database import engine
@@ -73,7 +73,12 @@ if settings.cors_origins:
 
 
 app.include_router(router)
-app.include_router(auth_router)
+app.include_router(google_router)
+app.include_router(yandex_router)
+app.include_router(apple_router)
+app.include_router(notion_router)
+app.include_router(jira_router)
+app.include_router(obsidian_router)
 app.include_router(session_router)
 app.include_router(integrations.router)
 app.include_router(reminders.router)
