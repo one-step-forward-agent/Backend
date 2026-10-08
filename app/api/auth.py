@@ -459,12 +459,10 @@ async def yandex_callback(
             headers={"Authorization": f"OAuth {token_data['access_token']}"},
             params={"format": "json"},
         )
-    if profile_response.is_error:
-        raise HTTPException(status_code=400, detail="Failed to fetch Yandex user profile")
-    profile = profile_response.json()
-    email = profile.get("default_email") or (profile.get("emails") or [None])[0]
-    if not email:
-        raise HTTPException(status_code=400, detail="Yandex account email was not returned")
+    # The email only labels the account: with the scope calendar:all alone Yandex returns no email
+    # (and no login without login:info), so the connection does not depend on it
+    profile = {} if profile_response.is_error else profile_response.json()
+    email = profile.get("default_email") or (profile.get("emails") or [None])[0] or profile.get("login")
 
     user = await session.get(User, user_id)
     if not user:

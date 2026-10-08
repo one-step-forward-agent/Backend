@@ -22,6 +22,7 @@ class FakeYandex:
 
     def __init__(self):
         self.token = "token-1"
+        self.profile = {"default_email": "olga@yandex.ru"}
         self.puts: list[tuple[str, str]] = []
         self.event_day = (datetime.now(TZ) + timedelta(days=1)).strftime("%Y%m%d")
 
@@ -34,7 +35,7 @@ class FakeYandex:
                 self.token = "token-2"
             return httpx.Response(200, json={"access_token": self.token, "refresh_token": "refresh-1", "expires_in": 31536000})
         if url.startswith("https://login.yandex.ru/info"):
-            return httpx.Response(200, json={"default_email": "olga@yandex.ru"})
+            return httpx.Response(200, json=self.profile)
         if not url.startswith("https://caldav.yandex.ru/"):
             raise AssertionError(f"unexpected request {request.method} {url}")
         if request.headers.get("Authorization") != f"OAuth {self.token}":
@@ -126,6 +127,17 @@ async def test_connect_imports_and_exports(client, user, fake_yandex):
     exported = await client.post(f"/api/integrations/yandex/export/{event_ids[0]}", headers=headers)
     assert exported.status_code == 201, exported.text
     assert len(fake_yandex.puts) == 1 and "SUMMARY:Купить хлеб" in fake_yandex.puts[0][1]
+
+
+async def test_connects_without_email(client, user, fake_yandex):
+    # With the scope calendar:all alone Yandex ID returns neither email nor login
+    headers, _ = user
+    fake_yandex.profile = {"id": "1000", "client_id": "client"}
+    callback = await connect(client, headers, fake_yandex)
+    assert callback.status_code == 303, callback.text
+    listed = {item["slug"]: item for item in (await client.get("/api/integrations", headers=headers)).json()}
+    assert listed["yandex"]["connection"]["status"] == "connected" and listed["yandex"]["connection"]["account_email"] is None
+    assert (await client.post("/api/integrations/yandex/test", headers=headers)).json() == {"status": "ok", "account": "Яндекс Календарь"}
 
 
 async def test_expired_token_is_refreshed(client, user, fake_yandex):
