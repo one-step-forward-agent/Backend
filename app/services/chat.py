@@ -80,6 +80,12 @@ ANALYZE_REQUEST = re.compile(
     r"|оптимизируй\w*|перепланир\w*|разгрузи\w*|помоги\s+(?:мне\s+)?(?:с\s+)?(?:план|распредел|перепланир|разгруз))",
     re.I,
 )
+# Splitting a big task into steps: "разбей подготовку к экзамену на шаги", "помоги подготовиться к экзамену 20 октября"
+BREAKDOWN_REQUEST = re.compile(
+    r"\b(?:разбей\w*|разбить|декомпоз\w*|подзадач\w*|по\s+шагам|на\s+шаги|на\s+этапы|план\s+подготовки"
+    r"|(?:помоги|помогите|как)\s+(?:мне\s+)?(?:подготовиться|спланировать\s+подготовку))",
+    re.I,
+)
 ALL_WORDS = re.compile(r"\b(?:все|всё|всех|целиком|полностью|весь)\b", re.I)
 # "их", "эти задачи", "только что добавленные" point at the tasks of the previous answer
 CONTEXT_TARGET = re.compile(
@@ -126,6 +132,7 @@ HELP_SECTIONS = [
     {"title": "Планировать", "examples": ["Созвон с командой завтра в 11:00 на час", "Каждую пятницу в 18:00 спортзал", "Отчёт, дедлайн в пятницу 18:00", "Конференция с 10 по 12 октября"]},
     {"title": "Менять и удалять", "examples": ["Перенеси созвон на пятницу в 15:00", "Продли встречу до 18:00", "Удали встречу с Олей", "Отметь отчёт выполненным"]},
     {"title": "Спрашивать и анализировать", "examples": ["Что у меня завтра?", "Проанализируй мою неделю", "Что можно перенести?", "Советы"]},
+    {"title": "Разбить на шаги", "examples": ["Помоги подготовиться к экзамену 20 октября", "Разбей переезд на шаги до конца месяца"]},
     {"title": "Быстрые команды", "examples": ["Сегодня", "Завтра", "Неделя", "Выполнено", "Статистика", "Напоминания"]},
 ]
 SIMPLE_TEXT_LIMIT = 100
@@ -481,7 +488,7 @@ async def run_command(session: AsyncSession, user: User, name: str) -> dict:
     if name == "done":
         return await agenda(session, user, "today", mark=True)
     if name == "stats":
-        return {"kind": "stats", **await tasks.daily_stats(session, user, 7)}
+        return await stats_reply(session, user)
     if name == "advice":
         return {"kind": "advice", "items": await insights.recommendations(session, user)}
     if name == "reminders":
@@ -491,6 +498,22 @@ async def run_command(session: AsyncSession, user: User, name: str) -> dict:
         await session.commit()
         return {"kind": "reminders", "settings": values}
     return {"kind": "help", "sections": HELP_SECTIONS}
+
+
+async def stats_reply(session: AsyncSession, user: User) -> dict:
+    """The week in numbers, the week before for comparison, and what the last weeks say about the user."""
+    from app.services import insights
+
+    week = await tasks.daily_stats(session, user, 7)
+    fortnight = await tasks.daily_stats(session, user, 14)
+    total, done = fortnight["total"] - week["total"], fortnight["done"] - week["done"]
+    found = await insights.habits(session, user, datetime.now(tasks.local_tz(user)))
+    return {
+        "kind": "stats",
+        **week,
+        "previous_percent": round(done * 100 / total) if total else None,
+        "habits": {key: found[key] for key in ("done_per_day", "planned_per_day", "spheres_done", "most_done", "weak_weekday", "slipping") if found.get(key)},
+    }
 
 
 # ---------- turning model output into draft items ----------
@@ -1415,6 +1438,8 @@ async def route(session: AsyncSession, user: User, text: str, tz: ZoneInfo, hist
         reply = await delete_request(session, user, text, tz)
     elif is_complete_request(text):
         reply = await complete_request(session, user, text, tz)
+    elif BREAKDOWN_REQUEST.search(text) and len(text) <= LOCAL_TEXT_LIMIT:
+        reply = await breakdown_request(session, user, text, tz)
     elif ANALYZE_REQUEST.search(text) and len(text) <= LOCAL_TEXT_LIMIT:
         reply = await analyze_request(session, user, text, tz)
     elif is_change_request(text):
@@ -1428,12 +1453,13 @@ async def route(session: AsyncSession, user: User, text: str, tz: ZoneInfo, hist
     if not items:
         calendar = await calendar_context(session, user, tz) if settings.gigachat_credentials else ""
         items, answer, intent = await extract_items(text, tz, history, calendar)
-    if not items and intent in ("delete", "complete", "analyze", "change"):
+    if not items and intent in ("delete", "complete", "analyze", "change", "breakdown"):
         routed = {
             "delete": lambda: delete_request(session, user, text, tz, forced=True),
             "complete": lambda: complete_request(session, user, text, tz),
             "analyze": lambda: analyze_request(session, user, text, tz),
             "change": lambda: change_request(session, user, text, tz, history),
+            "breakdown": lambda: breakdown_request(session, user, text, tz),
         }
         reply = await routed[intent]()
         if reply is not None:
@@ -1453,8 +1479,11 @@ async def route(session: AsyncSession, user: User, text: str, tz: ZoneInfo, hist
         from services.gigachat import GigaChatClient
 
         try:
+            from app.services import insights
+
             calendar = await calendar_context(session, user, tz)
-            answer = await GigaChatClient().chat_reply(text, str(tz), history, user.name, calendar)
+            known = insights.habits_text(await insights.habits(session, user, datetime.now(tz)))
+            answer = await GigaChatClient().chat_reply(text, str(tz), history, user.name, calendar, known)
         except Exception:
             logger.exception("GigaChat chat reply failed")
     answer = honest(answer)
@@ -1577,7 +1606,7 @@ async def complete_request(session: AsyncSession, user: User, text: str, tz: Zon
 
 
 async def analyze_request(session: AsyncSession, user: User, text: str, tz: ZoneInfo) -> dict:
-    """An analysis of the day, week or month, with moves of flexible tasks offered for confirmation."""
+    """An analysis of the day, week or month, with moves of untimed tasks offered for confirmation."""
     from app.services import insights
 
     now = datetime.now(tz)
@@ -1618,6 +1647,76 @@ async def analyze_request(session: AsyncSession, user: User, text: str, tz: Zone
         draft = await create_draft(session, user, items)
         return proposal(draft, tz, answer=summary, note="Предлагаю перенести эти задачи — проверьте и сохраните или отмените.")
     return {"kind": "answer", "text": summary}
+
+
+BREAKDOWN_DEFAULT_DAYS = 7
+BREAKDOWN_MAX_DAYS = 30
+BREAKDOWN_MAX_STEPS = 12
+
+
+async def breakdown_request(session: AsyncSession, user: User, text: str, tz: ZoneInfo) -> dict:
+    """A big task ("подготовиться к экзамену 20 октября") split into steps laid out over the days before it,
+    shown as a draft: the user sees how it fits the calendar, edits and saves it."""
+    from app.services import insights
+
+    if not settings.gigachat_credentials:
+        return {"kind": "answer", "text": "Разбивка на шаги сейчас недоступна. Добавьте шаги сами — например, «повторить билеты 1–10 завтра в 18:00»."}
+    now = datetime.now(tz)
+    today = now.date()
+    deadline_text, rest = take_deadline(text, now)
+    deadline = _iso_date(deadline_text) or dates.parse(rest, now).date
+    if deadline is None or deadline < today:
+        deadline = today + timedelta(days=BREAKDOWN_DEFAULT_DAYS)
+    deadline = min(deadline, today + timedelta(days=BREAKDOWN_MAX_DAYS))
+    profile = user.profile or {}
+    start = today if now.time() < insights.day_end(profile, today) else today + timedelta(days=1)
+    start = min(start, deadline)
+    events = await tasks.events_between(session, user, datetime.combine(start, time.min, tz), datetime.combine(deadline + timedelta(days=1), time.min, tz), limit=2000)
+    days = []
+    for offset in range((deadline - start).days + 1):
+        day = start + timedelta(days=offset)
+        of_day = [event for event in events if event.start_at.astimezone(tz).date() == day and event.completed_at is None]
+        begin = max(now, datetime.combine(day, insights.day_start(profile, day), tz))
+        windows = insights.free_windows(of_day, begin, datetime.combine(day, insights.day_end(profile, day), tz), minimum=60)
+        days.append(
+            {
+                "date": day.isoformat(),
+                "weekday": insights.WEEKDAYS_FULL[day.weekday()],
+                "tasks": len(of_day),
+                "free_time": [f"{first:%H:%M}–{last:%H:%M}" for first, last in windows[:3]],
+            }
+        )
+    facts = {
+        "today": today.isoformat(),
+        "start": start.isoformat(),
+        "deadline": deadline.isoformat(),
+        "days": days,
+        "busy_days": [day["date"] for day in days if day["tasks"] >= insights.BUSY_TASK_COUNT],
+        "habits": await insights.habits(session, user, now),
+    }
+    from services.gigachat import GigaChatClient
+
+    try:
+        result = await GigaChatClient().breakdown(text, facts)
+    except Exception:
+        logger.exception("GigaChat breakdown failed")
+        return {"kind": "answer", "text": "Не получилось разбить задачу — попробуйте ещё раз чуть позже."}
+    items = []
+    for step in result.get("steps") or []:
+        if not isinstance(step, dict) or not isinstance(step.get("title"), str):
+            continue
+        day = _iso_date(step.get("date"))
+        if day is None or not start <= day <= deadline:
+            continue
+        item = build_item(clean_title(step["title"]), dates.Parsed(), now, step | {"start_time": step.get("time")}, allow_llm_time=True)
+        if item:
+            items.append(item)
+    if not items:
+        return {"kind": "answer", "text": "Не получилось разбить задачу. Напишите, к чему и к какому сроку готовиться — например, «разбей подготовку к экзамену по истории на шаги до 20 октября»."}
+    items.sort(key=lambda item: (item["date"], item["time"] or ""))
+    draft = await create_draft(session, user, items[:BREAKDOWN_MAX_STEPS])
+    answer = result.get("answer") if isinstance(result.get("answer"), str) else None
+    return proposal(draft, tz, answer=honest(answer), note="Так шаги лягут в календарь. Поправьте, удалите лишнее и сохраните.")
 
 
 async def rate(session: AsyncSession, user: User, message_id: int, value: int) -> dict:

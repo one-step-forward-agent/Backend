@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import ratelimit
 from app.core.config import settings
-from app.models.models import Event, RecommendationCache, User
+from app.models.models import Event, RecommendationCache, Tag, User
 from app.services import dates, tasks, usage
 from app.services.ru import MONTHS, MONTHS_NOMINATIVE, WEEKDAYS_SHORT, plural
 
@@ -157,6 +157,130 @@ async def checkin(session: AsyncSession, user: User, now: datetime) -> tuple[str
     return "\n".join(lines), payload
 
 
+# ---------- the user's habits: what makes advice personal ----------
+
+HABIT_DAYS = 28
+SLIPPING_DAYS = 3
+DAY_PARTS = (("утром", 5, 12), ("днём", 12, 18), ("вечером", 18, 24))
+WEEKDAYS_FULL = ("понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье")
+
+
+def _part_of_day(moment: datetime) -> str | None:
+    return next((name for name, first, last in DAY_PARTS if first <= moment.hour < last), None)
+
+
+def _rate(done: int, total: int) -> int:
+    return round(done * 100 / total) if total else 0
+
+
+def habits_from(events: list[Event], tag_names: dict[int, str], now: datetime, profile: dict | None = None) -> dict:
+    """Patterns of the last weeks, each a plain sentence the model can quote: how much the user really
+    gets done a day, which spheres and times of day work and which do not, tasks that keep slipping.
+    Only tasks the user marks count (an all-day task, or a timed one marked done): a meeting that simply
+    passed says nothing about habits."""
+    tz = now.tzinfo
+    today = now.date()
+    profile = profile if isinstance(profile, dict) else {}
+    past = [event for event in events if event.start_at.astimezone(tz).date() < today and event.status != "cancelled"]
+    tracked = [event for event in past if event.all_day or event.completed_at is not None]
+    found: dict = {
+        "purpose": str(profile.get("purpose") or "") or None,
+        "goals": [str(goal) for goal in profile.get("goals") or []][:5],
+        "spheres": [str(sphere.get("name")) for sphere in profile.get("spheres") or [] if isinstance(sphere, dict)][:6],
+    }
+    if len(tracked) < 5:
+        found["note"] = "истории пока мало: советуй по сегодняшнему плану и целям"
+        return found
+
+    per_day: dict[date, list[int]] = {}
+    for event in past:
+        counts = per_day.setdefault(event.start_at.astimezone(tz).date(), [0, 0])
+        counts[0] += 1
+        counts[1] += tasks.is_done(event, now)
+    active_days = len(per_day) or 1
+    found["planned_per_day"] = round(sum(count[0] for count in per_day.values()) / active_days, 1)
+    found["done_per_day"] = round(sum(count[1] for count in per_day.values()) / active_days, 1)
+    done_tracked = sum(event.completed_at is not None for event in tracked)
+    found["marked_done_percent"] = _rate(done_tracked, len(tracked))
+
+    spheres: dict[str, list[int]] = {}
+    for event in tracked:
+        for tag_id in event.tag_ids or []:
+            if tag_id in tag_names:
+                counts = spheres.setdefault(tag_names[tag_id], [0, 0])
+                counts[0] += 1
+                counts[1] += event.completed_at is not None
+    rated = sorted(((name, _rate(done, total), total) for name, (total, done) in spheres.items() if total >= 3), key=lambda item: -item[1])
+    found["spheres_done"] = [f"{name}: выполнено {rate}% из {total}" for name, rate, total in rated][:6]
+
+    parts: dict[str, int] = {}
+    for event in tracked:
+        if event.completed_at is not None:
+            part = _part_of_day(event.completed_at.astimezone(tz))
+            if part:
+                parts[part] = parts.get(part, 0) + 1
+    if sum(parts.values()) >= 5:
+        best = max(parts, key=parts.get)
+        found["most_done"] = f"чаще всего отмечает задачи {best} ({_rate(parts[best], sum(parts.values()))}% выполненного)"
+
+    weekdays: dict[int, list[int]] = {}
+    for event in tracked:
+        counts = weekdays.setdefault(event.start_at.astimezone(tz).weekday(), [0, 0])
+        counts[0] += 1
+        counts[1] += event.completed_at is not None
+    weekday_rates = {day: _rate(done, total) for day, (total, done) in weekdays.items() if total >= 3}
+    if len(weekday_rates) >= 3:
+        worst, best = min(weekday_rates, key=weekday_rates.get), max(weekday_rates, key=weekday_rates.get)
+        if weekday_rates[best] - weekday_rates[worst] >= 20:
+            found["weak_weekday"] = f"{WEEKDAYS_FULL[worst]}: выполнено {weekday_rates[worst]}% (лучший день — {WEEKDAYS_FULL[best]}, {weekday_rates[best]}%)"
+
+    # The same unfinished task again and again, or one hanging for days
+    slipping = []
+    for event in past:
+        if tasks.is_overdue(event, today, tz):
+            age = (today - event.start_at.astimezone(tz).date()).days
+            if age >= SLIPPING_DAYS:
+                slipping.append((age, f"«{event.title}» не выполнена уже {age} {plural(age, 'день', 'дня', 'дней')}"))
+    series: dict[str, list[int]] = {}
+    for event in tracked:
+        if event.series_id:
+            counts = series.setdefault(event.title, [0, 0])
+            counts[0] += 1
+            counts[1] += event.completed_at is not None
+    for title, (total, done) in series.items():
+        if total >= 3 and done * 2 < total:
+            slipping.append((total - done, f"повторяющаяся «{title}»: выполнено {done} из {total}"))
+    found["slipping"] = [text for _, text in sorted(slipping, key=lambda item: -item[0])][:4]
+    return found
+
+
+async def habits(session: AsyncSession, user: User, now: datetime) -> dict:
+    tz = now.tzinfo
+    events = await tasks.events_between(
+        session, user, datetime.combine(now.date() - timedelta(days=HABIT_DAYS), time.min, tz), datetime.combine(now.date(), time.min, tz), limit=3000
+    )
+    tag_names = {tag.id: tag.name for tag in await session.scalars(select(Tag).where(Tag.user_id == user.id))}
+    return habits_from(events, tag_names, now, user.profile)
+
+
+def habits_text(data: dict) -> str:
+    """The habits as lines for a chat prompt."""
+    lines = []
+    if data.get("purpose"):
+        lines.append(f"Чем занимается: {data['purpose']}")
+    if data.get("goals"):
+        lines.append("Цели: " + "; ".join(data["goals"]))
+    if data.get("planned_per_day") is not None:
+        lines.append(f"В среднем планирует {data['planned_per_day']} задач в день, выполняет {data['done_per_day']}")
+    for key, label in (("spheres_done", "По сферам"), ("slipping", "Откладывается")):
+        if data.get(key):
+            lines.append(f"{label}: " + "; ".join(data[key]))
+    for key in ("most_done", "weak_weekday", "note"):
+        if data.get(key):
+            lines.append(str(data[key]))
+    return "\n".join(lines)
+
+
 # ---------- recommendations on the main screen ----------
 
 
@@ -220,8 +344,7 @@ async def facts(session: AsyncSession, user: User, now: datetime, ahead: bool = 
         "week_percent": stats["percent"],
         "week_total": stats["total"],
         "streak": stats["streak"],
-        "goals": [str(goal) for goal in profile.get("goals") or []][:5],
-        "spheres": [str(sphere.get("name")) for sphere in profile.get("spheres") or [] if isinstance(sphere, dict)][:6],
+        "habits": await habits(session, user, datetime.now(tz)),
         "tone": profile.get("toneOfVoice"),
     }
 
@@ -260,8 +383,15 @@ def rule_recommendations(data: dict) -> list[dict]:
     available = max(0, (int(data["day_end"][:2]) * 60 + int(data["day_end"][3:])) - (int(data["now"][:2]) * 60 + int(data["now"][3:])))
     if data["load_minutes"] > available and data["remaining_titles"]:
         found.append({"kind": "warning", "title": "Плотный день", "text": f"Задач на {data.get('day', 'сегодня')} больше, чем рабочего времени. Часть можно перенести на другой день."})
-    if data["week_total"] and data["week_percent"] < 50:
-        found.append({"kind": "info", "title": "Меньше задач — больше результата", "text": f"За неделю выполнено {data['week_percent']}% задач. Попробуйте планировать 3–5 главных дел в день."})
+    # Personal patterns rather than general advice: "plan 3–5 things a day" helps nobody
+    habit = data.get("habits") or {}
+    remaining = len(data["remaining_titles"])
+    if habit.get("done_per_day") and remaining >= habit["done_per_day"] + 3:
+        found.append({"kind": "warning", "title": "Больше обычного", "text": f"Обычно вы закрываете около {habit['done_per_day']:g} задач в день, а осталось {remaining}. Выберите главные, остальные перенесите."})
+    if habit.get("slipping"):
+        found.append({"kind": "warning", "title": "Задача буксует", "text": f"{habit['slipping'][0][:1].upper()}{habit['slipping'][0][1:]}. Разбейте её на шаги в чате — так проще начать."})
+    if habit.get("most_done") and data["untimed"]:
+        found.append({"kind": "info", "title": "Ваше продуктивное время", "text": f"Вы {habit['most_done']} — поставьте «{data['untimed'][0]}» на это время."})
     if data["streak"] >= 2:
         found.append({"kind": "success", "title": f"Серия {data['streak']} дн.", "text": "Все задачи выполнены несколько дней подряд — так держать!"})
     if not found:
@@ -287,7 +417,8 @@ def cache_key(user: User, now: datetime, events: list[Event], data: dict) -> str
         "today": sorted((event.id, event.completed_at is not None, event.start_at.isoformat()) for event in events),
         "overdue": data["overdue"],
         "week": data["week_percent"] // 10,
-        "profile": [data["goals"], data["tone"]],
+        "profile": [data["habits"].get("goals"), data["tone"]],
+        "habits": [data["habits"].get("slipping"), data["habits"].get("done_per_day")],
         "deadlines": data.get("deadlines"),
     }
     return hashlib.sha256(json.dumps(state, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest()
@@ -359,7 +490,8 @@ def period_label(scope: str, first: date, last: date) -> str:
 
 
 async def period_facts(session: AsyncSession, user: User, now: datetime, first: date, last: date, scope: str) -> dict:
-    """What the plan of a week or month looks like from today on: load per day, fixed and flexible tasks, deadlines."""
+    """What the plan of a week or month looks like from today on: load per day, tasks that cannot move
+    and untimed ones that can go on any day ("movable"), deadlines, and the user's habits."""
     tz = now.tzinfo
     today = now.date()
     profile = user.profile or {}
@@ -376,14 +508,14 @@ async def period_facts(session: AsyncSession, user: User, now: datetime, first: 
     free = [day for day, (count, _) in load.items() if count <= 1 and day.weekday() in workdays and day > today]
     upcoming = [event for event in events if event.start_at.astimezone(tz).date() >= today and event.completed_at is None]
     fixed = [event for event in upcoming if tasks.is_fixed(event)]
-    flexible = [event for event in upcoming if event.all_day and not tasks.is_fixed(event) and not event.series_id]
+    movable = [event for event in upcoming if event.all_day and not tasks.is_fixed(event) and not event.series_id]
     past = [event for event in events if event.start_at.astimezone(tz).date() < today]
 
     def when(event: Event) -> str:
         start = event.start_at.astimezone(tz)
         return day_text(start.date(), today) + ("" if event.all_day else f" {start:%H:%M}")
 
-    def flexible_text(event: Event) -> str:
+    def movable_text(event: Event) -> str:
         text = f"{event.title} ({when(event)})"
         if event.deadline_at:
             text += f", дедлайн {deadline_label(event.deadline_at.astimezone(tz), today)}"
@@ -396,11 +528,11 @@ async def period_facts(session: AsyncSession, user: User, now: datetime, first: 
         "busy_days": [f"{day_text(day, today)}: {load[day][0]} {plural(load[day][0], 'задача', 'задачи', 'задач')}" for day in busy][:5],
         "free_days": [day_text(day, today) for day in free][:7],
         "fixed": [f"{event.title} ({when(event)})" for event in fixed][:12],
-        "flexible": [flexible_text(event) for event in flexible][:12],
+        "movable": [movable_text(event) for event in movable][:12],
         "deadlines": await deadline_texts(session, user, now, last) if last >= today else [],
         "past_done": sum(tasks.is_done(event, now) for event in past),
         "past_total": len(past),
-        "goals": [str(goal) for goal in profile.get("goals") or []][:5],
+        "habits": await habits(session, user, now),
         "tone": profile.get("toneOfVoice"),
     }
 
@@ -415,13 +547,20 @@ def plan_rules(data: dict) -> list[dict]:
         target = f" Запланируйте её на {data['free_days'][0]} — там свободно." if data["free_days"] else ""
         found.append({"kind": "warning", "title": "Близкий дедлайн", "text": f"{data['deadlines'][0]}.{target}"})
     if data["busy_days"]:
-        target = f" Гибкие задачи можно перенести на {data['free_days'][0]}." if data["free_days"] else " Часть гибких задач стоит перенести."
+        target = f" Задачи без времени можно перенести на {data['free_days'][0]}." if data["free_days"] else " Часть задач без времени стоит перенести."
         found.append({"kind": "warning", "title": "Перегруженный день", "text": f"{data['busy_days'][0]}.{target}"})
-    if data["flexible"] and data["free_days"]:
-        found.append({"kind": "info", "title": "Есть свободные дни", "text": f"{', '.join(data['free_days'][:2])} почти свободны — хорошее время для «{data['flexible'][0].split(' (')[0]}»."})
+    if data["movable"] and data["free_days"]:
+        found.append({"kind": "info", "title": "Есть свободные дни", "text": f"{', '.join(data['free_days'][:2])} почти свободны — хорошее время для «{data['movable'][0].split(' (')[0]}»."})
+    habit = data.get("habits") or {}
+    if habit.get("slipping"):
+        found.append({"kind": "warning", "title": "Задача буксует", "text": f"{habit['slipping'][0][:1].upper()}{habit['slipping'][0][1:]}. Разбейте её на шаги в чате и поставьте первый шаг на свободный день."})
+    if habit.get("weak_weekday"):
+        found.append({"kind": "info", "title": "Слабый день недели", "text": f"Хуже всего у вас получается {habit['weak_weekday']}. Не ставьте на этот день важное."})
     if data["fixed"]:
-        count = len(data["fixed"])
-        found.append({"kind": "info", "title": "Неподвижные дела", "text": f"{count} {plural(count, 'задачу', 'задачи', 'задач')} нельзя переносить — остальное планируйте вокруг них."})
+        # Named, not counted: "2 задачи нельзя переносить" says nothing about which
+        rest = len(data["fixed"]) - 1
+        more = f" и ещё {rest} {plural(rest, 'задачу', 'задачи', 'задач')}" if rest else ""
+        found.append({"kind": "info", "title": "Это не сдвинуть", "text": f"«{data['fixed'][0]}»{more} нельзя переносить — остальное ставьте вокруг."})
     if not found:
         found.append({"kind": "success", "title": "План сбалансирован", "text": "Нагрузка распределена ровно. Добавляйте задачи в свободные дни."})
     return found[:3]
@@ -510,12 +649,12 @@ async def plan_moves(session: AsyncSession, user: User, now: datetime, first: da
     candidates = [today + timedelta(days=offset) for offset in range(1, (horizon - today).days + 1) if (today + timedelta(days=offset)).weekday() in workdays]
     candidates = candidates or [today + timedelta(days=1)]
 
-    def flexible(event: Event) -> bool:
+    def movable(event: Event) -> bool:
         return event.all_day and event.completed_at is None and not event.series_id and not tasks.is_fixed(event)
 
-    overdue = [event for event in events if flexible(event) and event.start_at.astimezone(tz).date() < today]
+    overdue = [event for event in events if movable(event) and event.start_at.astimezone(tz).date() < today]
     busy_days = [day for day, minutes in sorted(load.items()) if start <= day <= last and minutes > 6 * 60]
-    crowded = [event for event in events if flexible(event) and event.start_at.astimezone(tz).date() in busy_days]
+    crowded = [event for event in events if movable(event) and event.start_at.astimezone(tz).date() in busy_days]
     moves: list[tuple[Event, date]] = []
     for event in [*overdue, *crowded][:MAX_PLAN_MOVES]:
         current = event.start_at.astimezone(tz).date()

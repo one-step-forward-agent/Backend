@@ -28,6 +28,17 @@ NO_ACTION_CLAIMS = (
     "Твой текстовый ответ ничего не меняет в календаре. Никогда не пиши, что ты удалила, перенесла, изменила, "
     "отметила, отменила или добавила задачи: это делает приложение отдельно и само сообщит результат. "
 )
+# Advice is worth reading only when it is about this user: their tasks, their numbers, their habits
+PERSONAL_ADVICE = (
+    "Советы должны быть персональными. Каждый совет обязательно опирается на конкретику из фактов: называет задачу "
+    "в кавычках, день или время, или число из habits (сколько пользователь обычно выполняет за день, сферы с низким "
+    "процентом, задачи, которые откладываются, время дня, когда он чаще всё делает, слабый день недели). "
+    "Связывай план с целями и родом занятий пользователя, если они есть. "
+    "Запрещены общие советы, которые подходят любому: «планируйте 3–5 дел», «делайте перерывы», «не забывайте отмечать задачи», "
+    "«расставьте приоритеты», «берегите себя», «так держать». Если сказать нечего конкретного — дай меньше советов. "
+    "Не используй слова flexible, fixed, гибкие, movable и другие названия полей: говори «задачи без времени — их можно "
+    "поставить на любой день», «задачи, которые нельзя переносить». "
+)
 # The OAuth token lives 30 minutes; fetching it for every request doubled the latency
 TOKEN_MARGIN = 60
 _token_cache: dict = {"value": None, "expires": 0.0}
@@ -96,7 +107,7 @@ def parse_message_response(content: str) -> dict:
     result["answer"] = answer if isinstance(answer, str) else None
     result["events"] = events
     intent = result.get("intent")
-    result["intent"] = intent if intent in ("create", "change", "delete", "complete", "analyze", "other") else None
+    result["intent"] = intent if intent in ("create", "change", "delete", "complete", "analyze", "breakdown", "other") else None
     return result
 
 
@@ -213,8 +224,9 @@ class GigaChatClient:
             "полезный ответ на русском от лица Dayla, в женском роде, опираясь на расписание пользователя ниже.\n"
             "10. intent — что хочет пользователь: \"create\" (новые дела), \"change\" (перенести или изменить существующее), "
             "\"delete\" (удалить или отменить существующее), \"complete\" (отметить выполненным), "
-            "\"analyze\" (проанализировать загрузку, дать совет по плану, перепланировать), \"other\". "
-            "Для change, delete, complete и analyze events — пустой массив, answer — null.\n"
+            "\"analyze\" (проанализировать загрузку, дать совет по плану, перепланировать), "
+            "\"breakdown\" (помочь подготовиться к чему-то, разбить большую задачу на шаги или подзадачи), \"other\". "
+            "Для change, delete, complete, analyze и breakdown events — пустой массив, answer — null.\n"
             "Верни только валидный JSON без markdown: {\"intent\": строка, \"events\": [...], \"answer\": строка или null}. "
             "Поля объекта: title, date_phrase, time_phrase, recurrence_phrase, end_date_phrase, deadline_phrase, date, start_time, "
             "end_time, end_date, duration_minutes, recurrence_rule, description, location, reminder_minutes, fixed.\n"
@@ -280,7 +292,7 @@ class GigaChatClient:
         return parse_search_filters_response(result["choices"][0]["message"]["content"])
 
     async def chat_reply(
-        self, text: str, timezone: str = "Europe/Moscow", context: str = "", name: str | None = None, calendar: str = ""
+        self, text: str, timezone: str = "Europe/Moscow", context: str = "", name: str | None = None, calendar: str = "", habits: str = ""
     ) -> str:
         now = datetime.now(ZoneInfo(timezone))
         system = (
@@ -294,13 +306,20 @@ class GigaChatClient:
             "Если последнее твоё сообщение в диалоге — «Рекомендация Dayla», пользователь пришёл обсудить её: "
             "объясни её и предложи конкретные шаги по его расписанию. "
             "Если пользователь хочет что-то запланировать, но не указал дату или время, коротко уточни, когда это сделать. "
-            f"Сейчас {now:%d.%m.%Y %H:%M}, часовой пояс {timezone}."
+            "Ты знаешь привычки пользователя (блок «Что известно о пользователе»): опирайся на них, когда советуешь, — "
+            "сколько он обычно успевает, когда продуктивнее, что откладывает, какие у него цели. "
+            "Если пользователю нужно подготовиться к чему-то большому (экзамен, проект, переезд), предложи разбить это на шаги: "
+            "пусть напишет «разбей <задачу> на шаги до <дата>» — ты разложишь шаги по календарю. "
+            + PERSONAL_ADVICE
+            + f"Сейчас {now:%d.%m.%Y %H:%M}, часовой пояс {timezone}."
             + (f" Пользователя зовут {name}." if name else "")
         )
         user_message = (
             "Расписание пользователя из календаря — актуальные данные. О планах, задачах и свободном времени "
             "отвечай только по нему, а не по истории диалога:\n"
             f"{calendar or '(нет данных)'}\n\n"
+            "Что известно о пользователе (за последние 4 недели):\n"
+            f"{habits or '(пока мало данных)'}\n\n"
             "Недавний диалог (справочно, может быть устаревшим):\n"
             f"{context or '(пусто)'}\n\n"
             f"Сообщение пользователя:\n{text[:6000]}"
@@ -358,10 +377,13 @@ class GigaChatClient:
         prompt = (
             PERSONA
             + NO_ACTION_CLAIMS
+            + PERSONAL_ADVICE
             + f"Пользователь просит: «{request[:500]}». Проанализируй его план по фактам ниже, {tone}: "
-            "оцени загрузку, назови перегруженные и свободные дни, близкие дедлайны и то, что нельзя переносить (fixed), "
-            "и дай 2–4 конкретных совета, куда поставить гибкие задачи. Если в фактах есть moves — это переносы, которые "
-            "приложение предложит пользователю подтвердить: упомяни их как предложение, а не как сделанное. "
+            "сравни загрузку с тем, сколько он обычно успевает (habits), назови перегруженные и свободные дни, близкие дедлайны, "
+            "задачи, которые откладываются, и дай 2–4 конкретных совета: какую задачу на какой день или время поставить и почему "
+            "именно так для этого пользователя. Если в фактах есть moves — это переносы, которые приложение предложит "
+            "подтвердить: упомяни их как предложение, а не как сделанное. Если задача давно откладывается, предложи разбить её "
+            "на шаги — для этого пользователь может написать «разбей <задачу> на шаги». "
             "Пиши обычным текстом без markdown, до 900 символов, короткими абзацами или строками «• …». "
             "Не выдумывай задач, которых нет в фактах.\n"
             f"Факты: {json.dumps(facts, ensure_ascii=False, default=str)}"
@@ -378,6 +400,36 @@ class GigaChatClient:
             result = await self._chat(session, headers, payload, "analysis")
         return result["choices"][0]["message"]["content"].strip()
 
+    async def breakdown(self, request: str, facts: dict) -> dict:
+        """Steps of a big task laid out over the days before its deadline: {"answer": str, "steps": [...]}."""
+        prompt = (
+            PERSONA
+            + NO_ACTION_CLAIMS
+            + f"Пользователь просит помочь с большой задачей: «{request[:1000]}». Разбей её на 3–10 конкретных шагов "
+            "и разложи их по дням от start до deadline включительно (в фактах). Шаг — одно действие на 30–120 минут "
+            "с понятным результатом: «Повторить билеты 1–10», а не «Подготовка». Последний шаг — сама цель "
+            "(экзамен, сдача), если она в день deadline. Учитывай факты о пользователе: не ставь шаги на дни из busy_days, "
+            "ставь их в свободное время дня из free_time и в то время дня, когда пользователь обычно всё делает "
+            "(habits.most_done); если подходящее время не известно — time null. Оставь запас: последний подготовительный шаг — "
+            "не позже чем за день до deadline, если дней хватает. "
+            "Верни только JSON без markdown: {\"answer\": 1–2 предложения для пользователя о том, как ты разложила шаги "
+            "и почему так (с опорой на его загрузку или привычки), "
+            "\"steps\": [{\"title\": до 60 символов, \"date\": \"YYYY-MM-DD\", \"time\": \"HH:MM\" или null, "
+            "\"duration_minutes\": число}]}.\n"
+            f"Факты: {json.dumps(facts, ensure_ascii=False, default=str)}"
+        )
+        async with aiohttp.ClientSession() as session:
+            token = await self._token(session)
+            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            payload = {
+                "model": settings.gigachat_model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.3,
+                "max_tokens": 1500,
+            }
+            result = await self._chat(session, headers, payload, "breakdown")
+        return parse_search_filters_response(result["choices"][0]["message"]["content"])
+
     async def extract_events(self, text: str, timezone: str = "Europe/Moscow") -> list[dict]:
         return (await self.process_message(text, timezone))["events"]
 
@@ -390,10 +442,14 @@ class GigaChatClient:
         }.get(facts.get("tone"), "дружелюбно и по делу")
         prompt = (
             PERSONA
+            + PERSONAL_ADVICE
             + "По фактам о дне пользователя дай ровно 2 рекомендации, "
-            f"{tone}. Рекомендации — про день из поля day (сегодня или завтра). Каждая — конкретная и полезная на этот день: перенести задачу, занять свободное окно задачей без времени, "
-            "разгрузить плотный день, вернуться к целям пользователя. Не выдумывай задач, которых нет в фактах. "
-            "Верни только JSON-массив без markdown: [{\"kind\": \"info\" | \"warning\" | \"success\", "
+            f"{tone}. Рекомендации — про день из поля day (сегодня или завтра). Каждая — конкретное действие на этот день: "
+            "поставить задачу без времени в свободное окно (в то время дня, когда пользователь обычно всё делает), перенести часть "
+            "задач, если их больше, чем он обычно успевает, сдвинуть к дедлайну, разбить на шаги задачу, которая откладывается, "
+            "сделать шаг к цели. Не выдумывай задач, которых нет в фактах. "
+            "kind: \"warning\" — нужно действие (перенос, перегруз, дедлайн, откладывается), иначе \"info\". "
+            "Верни только JSON-массив без markdown: [{\"kind\": \"info\" | \"warning\", "
             "\"title\": до 4 слов, \"text\": до 160 символов}].\n"
             f"Факты: {json.dumps(facts, ensure_ascii=False)}"
         )
@@ -418,11 +474,14 @@ class GigaChatClient:
         }.get(facts.get("tone"), "дружелюбно и по делу")
         prompt = (
             PERSONA
+            + PERSONAL_ADVICE
             + f"Проанализируй план пользователя на период «{facts.get('period')}» и дай до 3 рекомендаций по расписанию, {tone}. "
-            "Задачи из списка fixed нельзя переносить: планируй вокруг них. Гибкие задачи (flexible) можно двигать: "
-            "предложи конкретный день из free_days или наименее загруженный день — обязательно раньше дедлайна задачи, если он есть. "
-            "Предупреди о перегруженных днях (busy_days) и близких дедлайнах (deadlines). Называй задачи и дни так, как они даны в фактах, "
-            "не выдумывай задач. Верни только JSON-массив без markdown: [{\"kind\": \"info\" | \"warning\" | \"success\", "
+            "Задачи из списка fixed нельзя переносить: планируй вокруг них. Задачи из списка movable — без времени, их можно "
+            "поставить на любой день: предложи конкретный день из free_days или наименее загруженный — обязательно раньше дедлайна "
+            "задачи, если он есть, и не на слабый день недели из habits. Предупреди о перегруженных днях (busy_days), близких "
+            "дедлайнах (deadlines) и задачах, которые откладываются (habits.slipping). Называй задачи и дни так, как они даны "
+            "в фактах, не выдумывай задач. kind: \"warning\" — нужно действие, иначе \"info\". "
+            "Верни только JSON-массив без markdown: [{\"kind\": \"info\" | \"warning\", "
             "\"title\": до 4 слов, \"text\": до 200 символов}].\n"
             f"Факты: {json.dumps(facts, ensure_ascii=False)}"
         )
@@ -443,6 +502,6 @@ def clean_recommendations(content: str, limit: int) -> list[dict]:
     cleaned = []
     for item in parse_events_response(content)[:limit]:
         if isinstance(item, dict) and isinstance(item.get("title"), str) and isinstance(item.get("text"), str):
-            kind = item.get("kind") if item.get("kind") in ("info", "warning", "success") else "info"
+            kind = "warning" if item.get("kind") == "warning" else "info"
             cleaned.append({"kind": kind, "title": item["title"][:60], "text": item["text"][:280]})
     return cleaned

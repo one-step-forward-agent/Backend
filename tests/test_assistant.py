@@ -346,7 +346,7 @@ async def test_free_form_answers_get_the_real_calendar(client, user, fake_gigach
 
     seen = {}
 
-    async def chat_reply(self, text, timezone="Europe/Moscow", context="", name=None, calendar=""):
+    async def chat_reply(self, text, timezone="Europe/Moscow", context="", name=None, calendar="", habits=""):
         seen["calendar"] = calendar
         return "Ответ"
 

@@ -255,3 +255,43 @@ async def test_calendar_recommendations_and_chat_topic(client, user):
     await client.post("/api/assistant/topic", json=topic, headers=headers)  # opening it again does not repeat it
     history = (await client.get("/api/assistant/history", headers=headers)).json()
     assert [item["reply"] for item in history if item["reply"] and item["reply"]["kind"] == "topic"] == [reply]
+
+
+async def test_breakdown_lays_steps_before_the_deadline(client, user, fake_gigachat, monkeypatch):
+    from services import gigachat
+
+    headers, _ = user
+    exam = today() + timedelta(days=5)
+    seen = {}
+
+    async def breakdown(self, request, facts):
+        seen.update(facts)
+        return {
+            "answer": "Разложила подготовку вечерами.",
+            "steps": [
+                {"title": "Экзамен", "date": exam.isoformat(), "time": "10:00", "duration_minutes": 120},
+                {"title": "Повторить билеты 1–10", "date": (today() + timedelta(days=1)).isoformat(), "time": "19:00", "duration_minutes": 90},
+                {"title": "После экзамена", "date": (exam + timedelta(days=3)).isoformat(), "time": None},
+                {"title": "Без даты"},
+            ],
+        }
+
+    monkeypatch.setattr(gigachat.GigaChatClient, "breakdown", breakdown)
+    month = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря"]
+    reply = await chat(client, headers, f"Помоги подготовиться к экзамену {exam.day} {month[exam.month - 1]}")
+    assert reply["kind"] == "proposal" and reply["answer"] == "Разложила подготовку вечерами."
+    assert seen["deadline"] == exam.isoformat() and "habits" in seen and len(seen["days"]) >= 5
+    # Steps outside the period or without a date are dropped, the rest go in date order
+    assert [(item["title"], item["date"], item["time"]) for item in reply["events"]] == [
+        ("Повторить билеты 1–10", (today() + timedelta(days=1)).isoformat(), "19:00"),
+        ("Экзамен", exam.isoformat(), "10:00"),
+    ]
+    assert reply["events"][1]["end_time"] == "12:00"
+    created = await confirm(client, headers, reply)
+    assert created["kind"] == "created" and len(created["event_ids"]) == 2
+
+
+async def test_stats_compare_with_the_previous_week(client, user):
+    headers, _ = user
+    reply = await chat(client, headers, "Статистика")
+    assert reply["kind"] == "stats" and "previous_percent" in reply and isinstance(reply["habits"], dict)
