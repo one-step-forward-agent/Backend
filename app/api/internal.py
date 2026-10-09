@@ -107,6 +107,15 @@ async def chat_undo(chat_id: int, payload: BotUndoRequest, session: AsyncSession
     return {"deleted": await chat.undo(session, user, payload.event_ids)}
 
 
+@router.post("/chat/{chat_id}/reminders/{reminder_id}/cancel")
+async def chat_cancel_reminder(chat_id: int, reminder_id: int, session: AsyncSession = Depends(get_session)):
+    user = await _user_by_chat(session, chat_id)
+    try:
+        return await chat.cancel_reminder(session, user, reminder_id)
+    except LookupError:
+        raise HTTPException(status_code=404, detail="Напоминание уже пришло или отменено") from None
+
+
 @router.post("/chat/{chat_id}/drafts/{draft_id}/edit")
 async def draft_edit(chat_id: int, draft_id: int, payload: BotEditRequest, session: AsyncSession = Depends(get_session)):
     user = await _user_by_chat(session, chat_id)

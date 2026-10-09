@@ -7,6 +7,8 @@ import uuid
 os.environ.setdefault("SECRET_KEY", "test-secret-key-that-is-long-enough-1234567890")  # gitleaks:allow - test-only value
 os.environ.setdefault("BOT_API_TOKEN", "test-bot-token-0123456789abcdef")  # gitleaks:allow - test-only value
 os.environ.setdefault("SBER_AUTHORIZATION_KEY", "")
+# The rule-based assistant is tested on its own; tests of the agent turn it on with a scripted model
+os.environ.setdefault("ASSISTANT_AGENT", "false")
 os.environ.setdefault("STORAGE_PATH", "/tmp/dayla-test-storage")
 
 import httpx

@@ -68,6 +68,10 @@ class Settings:
     gigachat_credentials: str = os.getenv("SBER_AUTHORIZATION_KEY", "")
     gigachat_scope: str = os.getenv("SBER_SCOPE", "GIGACHAT_API_PERS")
     gigachat_model: str = os.getenv("GIGACHAT_MODEL", "GigaChat")
+    # The chat assistant is an agent that calls the app's functions (app/services/agent.py);
+    # off: the older rule-based routing in app/services/chat.py answers alone
+    assistant_agent: bool = _bool("ASSISTANT_AGENT", True)
+    gigachat_agent_model: str = os.getenv("GIGACHAT_AGENT_MODEL") or os.getenv("GIGACHAT_MODEL", "GigaChat")
     jwt_algorithm: str = os.getenv("JWT_ALGORITHM", "HS256")
     jwt_expire_minutes: int = int(os.getenv("JWT_EXPIRE_MINUTES", "15"))
     jwt_refresh_expire_days: int = int(os.getenv("JWT_REFRESH_EXPIRE_DAYS", "30"))

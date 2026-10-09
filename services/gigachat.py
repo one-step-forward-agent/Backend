@@ -384,8 +384,8 @@ class GigaChatClient:
             "именно так для этого пользователя. Если в фактах есть moves — это переносы, которые приложение предложит "
             "подтвердить: упомяни их как предложение, а не как сделанное. Если задача давно откладывается, предложи разбить её "
             "на шаги — для этого пользователь может написать «разбей <задачу> на шаги». "
-            "Пиши обычным текстом без markdown, до 900 символов, короткими абзацами или строками «• …». "
-            "Не выдумывай задач, которых нет в фактах.\n"
+            "Обращайся к пользователю на «вы». Пиши обычным текстом без markdown, до 900 символов, короткими абзацами или строками «• …». "
+            "Не выдумывай задач, которых нет в фактах. Если в фактах есть profile — учитывай сферы и цели по приоритету и рабочий график.\n"
             f"Факты: {json.dumps(facts, ensure_ascii=False, default=str)}"
         )
         async with aiohttp.ClientSession() as session:
@@ -398,7 +398,7 @@ class GigaChatClient:
                 "max_tokens": 700,
             }
             result = await self._chat(session, headers, payload, "analysis")
-        return result["choices"][0]["message"]["content"].strip()
+        return clean_list(result["choices"][0]["message"]["content"])
 
     async def breakdown(self, request: str, facts: dict) -> dict:
         """Steps of a big task laid out over the days before its deadline: {"answer": str, "steps": [...]}."""
@@ -429,6 +429,31 @@ class GigaChatClient:
             }
             result = await self._chat(session, headers, payload, "breakdown")
         return parse_search_filters_response(result["choices"][0]["message"]["content"])
+
+    async def agent_step(self, messages: list[dict], functions: list[dict]) -> dict:
+        """One step of the assistant agent: the model either calls one of `functions` or answers.
+        Returns the assistant message as GigaChat sent it ({"content", "function_call"?, "functions_state_id"?})."""
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
+            token = await self._token(session)
+            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            payload = {
+                "model": settings.gigachat_agent_model,
+                "messages": messages,
+                "functions": functions,
+                "function_call": "auto",
+                "temperature": 0.2,
+                "max_tokens": 1500,
+            }
+            result = await self._chat(session, headers, payload, "agent")
+        message = result["choices"][0]["message"]
+        call = message.get("function_call")
+        if call and isinstance(call.get("arguments"), str):
+            # Some model versions send the arguments as a JSON string
+            try:
+                call["arguments"] = json.loads(call["arguments"])
+            except json.JSONDecodeError:
+                call["arguments"] = {}
+        return message
 
     async def extract_events(self, text: str, timezone: str = "Europe/Moscow") -> list[dict]:
         return (await self.process_message(text, timezone))["events"]
@@ -496,6 +521,15 @@ class GigaChatClient:
             }
             result = await self._chat(session, headers, payload, "plan_recommendations")
         return clean_recommendations(result["choices"][0]["message"]["content"], 3)
+
+
+def clean_list(content: str) -> str:
+    """Plain text with "• " bullets: the model mixes "-", "*", "- •" and markdown bold."""
+    lines = []
+    for line in content.strip().splitlines():
+        line = re.sub(r"^\s*(?:[-*•]\s*)+(?=\S)", "• ", line) if re.match(r"^\s*[-*•]", line) else line
+        lines.append(line.replace("**", ""))
+    return "\n".join(lines).strip()
 
 
 def clean_recommendations(content: str, limit: int) -> list[dict]:

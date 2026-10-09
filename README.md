@@ -6,6 +6,8 @@ Backend for Focus Day, a calendar assistant built on FastAPI. It stores users, c
 
 - **Events and calendars**: CRUD for events, including reminders and recurrence, plus file attachments (PDF, DOC/DOCX, XLS/XLSX, PNG/JPG).
 - **AI assistant**: natural-language requests (in Russian) are parsed by GigaChat into proposed events, which the user confirms before they are saved.
+- **Assistant agent** (`app/services/agent.py`): GigaChat gets the user's onboarding profile (spheres and goals by priority, tone of voice, work days and hours), habits and the plan for the next 7 days, and calls the app's functions: find, add, change, move, delete and complete tasks, set reminders, analyse the plan, split a big task into steps. The app runs each function and returns the real result to the model. Changes go into one draft the user confirms; completing tasks and reminders apply at once. Built to work with the free GigaChat Lite: tasks get short per-turn numbers, days and times are resolved from the user's own words by `app/services/dates.py`, the chosen task is checked against the words of the request, and confirmations are written by the app, not by the model. A clear command the model only talked about is done by the rule-based handlers; when GigaChat is unreachable they answer alone (`ASSISTANT_AGENT=false` turns the agent off).
+- **Reminders on request**: "напомни помыть посуду через 10 минут", "напомни завтра в 9 позвонить в банк" — the bot sends the message at that time (also in quiet hours, since the user chose it), with snooze buttons. "Какие у меня напоминания?", "отмени напоминание про посуду", or "Отменить" under the answer (`DELETE /api/assistant/reminders/{id}`). They need Telegram to be connected.
 - **Voice input**: audio is converted with ffmpeg and transcribed through Google Speech Recognition (`ru-RU`).
 - **Document input**: text is extracted from PDF/DOCX files and passed to the assistant.
 - **Google Calendar**: OAuth login, two-way sync of events and calendars.
@@ -77,6 +79,8 @@ Copy `.env.example` to `.env` and fill in the values:
 | `SBER_AUTHORIZATION_KEY` | GigaChat authorization key |
 | `SBER_SCOPE` | GigaChat scope (default `GIGACHAT_API_PERS`) |
 | `GIGACHAT_MODEL` | GigaChat model name (default `GigaChat`) |
+| `GIGACHAT_AGENT_MODEL` | Model of the assistant agent (default: `GIGACHAT_MODEL`); `GigaChat-2-Pro` picks functions more reliably than the free Lite |
+| `ASSISTANT_AGENT` | `false` turns the agent off: the rule-based assistant answers alone (default `true`) |
 | `STORAGE_PATH` | Directory for uploaded files (default `./storage`) |
 | `MAX_FILE_SIZE_MB` | Upload size limit (default `20`) |
 

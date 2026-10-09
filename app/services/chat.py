@@ -132,6 +132,7 @@ HELP_SECTIONS = [
     {"title": "Планировать", "examples": ["Созвон с командой завтра в 11:00 на час", "Каждую пятницу в 18:00 спортзал", "Отчёт, дедлайн в пятницу 18:00", "Конференция с 10 по 12 октября"]},
     {"title": "Менять и удалять", "examples": ["Перенеси созвон на пятницу в 15:00", "Продли встречу до 18:00", "Удали встречу с Олей", "Отметь отчёт выполненным"]},
     {"title": "Спрашивать и анализировать", "examples": ["Что у меня завтра?", "Проанализируй мою неделю", "Что можно перенести?", "Советы"]},
+    {"title": "Напоминать", "examples": ["Напомни помыть посуду через 10 минут", "Напомни завтра в 9:00 позвонить в банк", "Какие у меня напоминания?"]},
     {"title": "Разбить на шаги", "examples": ["Помоги подготовиться к экзамену 20 октября", "Разбей переезд на шаги до конца месяца"]},
     {"title": "Быстрые команды", "examples": ["Сегодня", "Завтра", "Неделя", "Выполнено", "Статистика", "Напоминания"]},
 ]
@@ -1349,7 +1350,7 @@ def summarize(reply: dict) -> str:
     if kind == "topic":
         return f"Рекомендация Dayla — {reply['title']}: {reply['text']}"
     if kind == "delete_proposal":
-        return f"Предложила удалить {reply['count']} задач: {reply['title']}"
+        return f"Предложила удалить {reply['count']} задач: {reply['title']}" + (f". {reply['answer']}" if reply.get("answer") else "")
     if kind == "completed":
         return "Отметила выполненными: " + "; ".join(event["title"] for event in reply["events"])
     if kind == "stats":
@@ -1361,10 +1362,21 @@ def summarize(reply: dict) -> str:
     if kind == "reminders":
         return "Показала настройки напоминаний"
     if kind == "proposal":
-        return "Предложила добавить: " + "; ".join(f"{event['title']} ({event['start']})" for event in reply["events"])
+        changes = [event for event in reply["events"] if event.get("event_id")]
+        new = [event for event in reply["events"] if not event.get("event_id")]
+        parts = []
+        if new:
+            parts.append("Предложила добавить: " + "; ".join(f"{event['title']} ({event['start']})" for event in new))
+        if changes:
+            parts.append("Предложила изменить: " + "; ".join(f"{event['title']} → {event['start']}" for event in changes))
+        text = ". ".join(parts)
+        return f"{text}. {reply['answer']}" if reply.get("answer") else text
     if kind == "agenda":
         count = sum(len(day["events"]) for day in reply["days"])
-        return f"Показала события ({reply['title']}): {count}"
+        shown = f"Показала события ({reply['title']}): {count}"
+        return f"{shown}. {reply['answer']}" if reply.get("answer") else shown
+    if kind == "reminder":
+        return "Поставила напоминание: " + "; ".join(f"{item['label']} — {item['text']}" for item in reply["reminders"])
     return reply.get("text") or "Не нашла событий в сообщении"
 
 
@@ -1433,6 +1445,14 @@ async def route(session: AsyncSession, user: User, text: str, tz: ZoneInfo, hist
     name = command(text)
     if name:
         return await run_command(session, user, name)
+    if settings.assistant_agent and settings.gigachat_credentials:
+        from app.services import agent
+
+        try:
+            return await agent.run(session, user, text, tz)
+        except agent.AgentFailed:
+            # GigaChat is unreachable before anything was done: the rules below still handle the usual requests
+            pass
     reply = None
     if is_delete_request(text):
         reply = await delete_request(session, user, text, tz)
@@ -1654,13 +1674,31 @@ BREAKDOWN_MAX_DAYS = 30
 BREAKDOWN_MAX_STEPS = 12
 
 
+BREAKDOWN_UNAVAILABLE = "Разбивка на шаги сейчас недоступна. Добавьте шаги сами — например, «повторить билеты 1–10 завтра в 18:00»."
+BREAKDOWN_FAILED = "Не получилось разбить задачу — попробуйте ещё раз чуть позже."
+BREAKDOWN_UNCLEAR = (
+    "Не получилось разбить задачу. Напишите, к чему и к какому сроку готовиться — например, "
+    "«разбей подготовку к экзамену по истории на шаги до 20 октября»."
+)
+
+
 async def breakdown_request(session: AsyncSession, user: User, text: str, tz: ZoneInfo) -> dict:
     """A big task ("подготовиться к экзамену 20 октября") split into steps laid out over the days before it,
     shown as a draft: the user sees how it fits the calendar, edits and saves it."""
+    if not settings.gigachat_credentials:
+        return {"kind": "answer", "text": BREAKDOWN_UNAVAILABLE}
+    found = await breakdown_items(session, user, text, tz)
+    if isinstance(found, str):
+        return {"kind": "answer", "text": found}
+    items, answer = found
+    draft = await create_draft(session, user, items)
+    return proposal(draft, tz, answer=honest(answer), note="Так шаги лягут в календарь. Поправьте, удалите лишнее и сохраните.")
+
+
+async def breakdown_items(session: AsyncSession, user: User, text: str, tz: ZoneInfo) -> tuple[list[dict], str | None] | str:
+    """The steps of a big task as draft items with the model's explanation, or a message why there are none."""
     from app.services import insights
 
-    if not settings.gigachat_credentials:
-        return {"kind": "answer", "text": "Разбивка на шаги сейчас недоступна. Добавьте шаги сами — например, «повторить билеты 1–10 завтра в 18:00»."}
     now = datetime.now(tz)
     today = now.date()
     deadline_text, rest = take_deadline(text, now)
@@ -1696,11 +1734,25 @@ async def breakdown_request(session: AsyncSession, user: User, text: str, tz: Zo
     }
     from services.gigachat import GigaChatClient
 
-    try:
-        result = await GigaChatClient().breakdown(text, facts)
-    except Exception:
-        logger.exception("GigaChat breakdown failed")
-        return {"kind": "answer", "text": "Не получилось разбить задачу — попробуйте ещё раз чуть позже."}
+    items = []
+    # A small model sometimes answers without valid steps: one more try before giving up
+    for _ in range(2):
+        try:
+            result = await GigaChatClient().breakdown(text, facts)
+        except Exception:
+            logger.exception("GigaChat breakdown failed")
+            return BREAKDOWN_FAILED
+        items = breakdown_steps(result, start, deadline, now)
+        if items:
+            break
+    if not items:
+        return BREAKDOWN_UNCLEAR
+    items.sort(key=lambda item: (item["date"], item["time"] or ""))
+    answer = result.get("answer") if isinstance(result.get("answer"), str) else None
+    return items[:BREAKDOWN_MAX_STEPS], answer
+
+
+def breakdown_steps(result: dict, start: date, deadline: date, now: datetime) -> list[dict]:
     items = []
     for step in result.get("steps") or []:
         if not isinstance(step, dict) or not isinstance(step.get("title"), str):
@@ -1711,12 +1763,7 @@ async def breakdown_request(session: AsyncSession, user: User, text: str, tz: Zo
         item = build_item(clean_title(step["title"]), dates.Parsed(), now, step | {"start_time": step.get("time")}, allow_llm_time=True)
         if item:
             items.append(item)
-    if not items:
-        return {"kind": "answer", "text": "Не получилось разбить задачу. Напишите, к чему и к какому сроку готовиться — например, «разбей подготовку к экзамену по истории на шаги до 20 октября»."}
-    items.sort(key=lambda item: (item["date"], item["time"] or ""))
-    draft = await create_draft(session, user, items[:BREAKDOWN_MAX_STEPS])
-    answer = result.get("answer") if isinstance(result.get("answer"), str) else None
-    return proposal(draft, tz, answer=honest(answer), note="Так шаги лягут в календарь. Поправьте, удалите лишнее и сохраните.")
+    return items
 
 
 async def rate(session: AsyncSession, user: User, message_id: int, value: int) -> dict:
@@ -2001,3 +2048,17 @@ async def begin_move(session: AsyncSession, user: User, event_id: int) -> dict:
     event = await own_event(session, user, event_id)
     draft = await create_draft(session, user, [event_item(event, tasks.local_tz(user))])
     return await begin_edit(session, user, draft.id, 0, "date") | {"draft_id": draft.id}
+
+
+async def cancel_reminder(session: AsyncSession, user: User, reminder_id: int) -> dict:
+    """"Отменить" under a reminder the assistant set; the chat message shows that it is cancelled."""
+    from app.services import reminders
+
+    notification = await reminders.cancel_custom(session, user, reminder_id)
+    if not notification:
+        raise LookupError(reminder_id)
+    view = reminders.custom_view(notification, tasks.local_tz(user))
+    reply = {"kind": "cancelled", "text": f"Напоминание отменено: {view['text']}"}
+    await remember(session, user.id, "assistant", reply["text"], reply)
+    await session.commit()
+    return reply

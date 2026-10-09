@@ -38,6 +38,8 @@ class NotificationStatus(StrEnum):
     SENT = "sent"
     FAILED = "failed"
     EXPIRED = "expired"
+    # A reminder the user asked to cancel before it was sent
+    CANCELLED = "cancelled"
 
 
 class User(Base):

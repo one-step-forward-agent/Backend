@@ -323,6 +323,15 @@ async def assistant_undo(payload: UndoRequest, user: User = Depends(get_current_
     return {"deleted": await chat.undo(session, user, payload.event_ids)}
 
 
+@router.delete("/assistant/reminders/{reminder_id}")
+async def assistant_cancel_reminder(reminder_id: int, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    """"Отменить" under a reminder the assistant set ("напомни через 10 минут …")."""
+    try:
+        return await chat.cancel_reminder(session, user, reminder_id)
+    except LookupError:
+        raise HTTPException(status_code=404, detail="Напоминание уже пришло или отменено") from None
+
+
 @router.post("/assistant/events/{event_id}/move")
 async def assistant_move(event_id: int, payload: MoveToDayRequest, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
     """"Перенести" in the chat's list of tasks: the task gets the chosen day and keeps its time."""

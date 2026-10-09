@@ -3,7 +3,7 @@ import secrets
 from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import and_, bindparam, or_, select, text, update
+from sqlalchemy import and_, bindparam, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -24,6 +24,12 @@ DEADLINE_STAGES = (4320, 1440, 120)
 CLAIM_TIMEOUT = timedelta(minutes=5)
 MAX_ATTEMPTS = 3
 LINK_CODE_LIFETIME = timedelta(minutes=15)
+# A reminder the user asked for ("напомни помыть посуду через 10 минут"): not tied to a task
+CUSTOM_KIND = "custom"
+# A custom reminder is still worth sending this long after its time (the bot was down, quiet hours of Telegram)
+CUSTOM_GRACE = timedelta(hours=12)
+MAX_CUSTOM_AHEAD = timedelta(days=366)
+MAX_PENDING_CUSTOM = 100
 
 LEGACY_EVENTS = text(
     "UPDATE events SET user_id = :user_id, calendar_id = :calendar_id, start_at = starts_at, "
@@ -275,7 +281,8 @@ async def claim(session: AsyncSession, limit: int = 50) -> list[dict]:
             notification.status = NotificationStatus.EXPIRED
             continue
         local_time = now.astimezone(ZoneInfo(user_timezone(user))).time()
-        if notification.kind != "test" and reminder_settings and reminder_settings.quiet_hours_enabled and in_quiet_hours(reminder_settings, local_time):
+        # A test and a reminder the user asked for at a set time are sent even in quiet hours
+        if notification.kind not in ("test", CUSTOM_KIND) and reminder_settings and reminder_settings.quiet_hours_enabled and in_quiet_hours(reminder_settings, local_time):
             continue
         notification.status = NotificationStatus.SENDING
         notification.claimed_at = now
@@ -393,3 +400,83 @@ async def snooze(session: AsyncSession, notification: Notification, minutes: int
     session.add(copy)
     await session.commit()
     return copy
+
+
+class ReminderError(ValueError):
+    pass
+
+
+def custom_text(text: str) -> str:
+    return f"🔔 <b>Напоминание</b>\n\n{html.escape(text)}"
+
+
+def custom_view(notification: Notification, tz: ZoneInfo) -> dict:
+    moment = notification.scheduled_for.astimezone(tz)
+    today = datetime.now(tz).date()
+    return {
+        "id": notification.id,
+        "text": (notification.payload or {}).get("text") or notification.text,
+        "at": moment.isoformat(),
+        "label": f"{relative_day(moment.date(), today)} в {moment:%H:%M}",
+    }
+
+
+async def create_custom(session: AsyncSession, user: User, text: str, moment: datetime) -> Notification:
+    """A reminder at `moment` sent to Telegram; raises ReminderError when it cannot be delivered."""
+    text = " ".join(str(text or "").split()).strip(" .")[:500]
+    if not text:
+        raise ReminderError("Не понятно, о чём напомнить")
+    now = datetime.now(timezone.utc)
+    if moment <= now - timedelta(minutes=1):
+        raise ReminderError("Это время уже прошло")
+    if moment > now + MAX_CUSTOM_AHEAD:
+        raise ReminderError("Напоминание можно поставить не дальше чем на год вперёд")
+    if not user.telegram_chat_id:
+        raise ReminderError("Telegram не подключён: напоминания приходят в Telegram-бот Dayla")
+    pending = await session.scalar(
+        select(func.count()).select_from(Notification).where(
+            Notification.user_id == user.id, Notification.kind == CUSTOM_KIND, Notification.status == NotificationStatus.PENDING
+        )
+    )
+    if pending >= MAX_PENDING_CUSTOM:
+        raise ReminderError("Слишком много активных напоминаний — отмените ненужные")
+    moment = max(moment, now)
+    text = text[:1].upper() + text[1:]
+    notification = Notification(
+        user_id=user.id,
+        kind=CUSTOM_KIND,
+        dedupe_key=f"custom:{user.id}:{secrets.token_hex(8)}",
+        text=custom_text(text),
+        payload={"text": text},
+        scheduled_for=moment,
+        expires_at=moment + CUSTOM_GRACE,
+        status=NotificationStatus.PENDING,
+        attempts=0,
+    )
+    session.add(notification)
+    await get_settings(session, user)
+    await session.flush()
+    return notification
+
+
+async def pending_custom(session: AsyncSession, user: User) -> list[Notification]:
+    return list(
+        await session.scalars(
+            select(Notification)
+            .where(Notification.user_id == user.id, Notification.kind == CUSTOM_KIND, Notification.status == NotificationStatus.PENDING)
+            .order_by(Notification.scheduled_for)
+            .limit(MAX_PENDING_CUSTOM)
+        )
+    )
+
+
+async def cancel_custom(session: AsyncSession, user: User, notification_id: int) -> Notification | None:
+    """Cancel the user's reminder that has not been sent yet; None when there is no such reminder."""
+    notification = await session.get(Notification, notification_id)
+    if not notification or notification.user_id != user.id or notification.kind != CUSTOM_KIND:
+        return None
+    if notification.status != NotificationStatus.PENDING:
+        return None
+    notification.status = NotificationStatus.CANCELLED
+    await session.flush()
+    return notification
