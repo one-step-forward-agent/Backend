@@ -30,6 +30,8 @@ class FakeServices:
         # What the user allowed on Google's consent page; Google lets them untick the calendar
         self.google_scope = "openid https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/calendar.calendarlist.readonly"
         self.revoked: list[str] = []
+        # Google refuses the refresh token: revoked, or a week old while the Google app is in testing
+        self.google_expired = False
         self.jira_token = "j-1"
         # The Google event as Google keeps it; PATCH changes it unless google_patch_status says otherwise
         self.google_start = datetime.combine(TOMORROW, time(10), TZ)
@@ -41,6 +43,10 @@ class FakeServices:
         self.calls.append((method, url))
         body = json.loads(request.content) if request.content and request.headers.get("content-type", "").startswith("application/json") else None
         # Google
+        if url == "https://oauth2.googleapis.com/token" and self.google_expired and b"grant_type=refresh_token" in request.content:
+            return httpx.Response(400, json={"error": "invalid_grant"})
+        if url.startswith("https://www.googleapis.com/") and self.google_expired:
+            return httpx.Response(401, json={"error": {"code": 401}})
         if url == "https://oauth2.googleapis.com/token":
             return httpx.Response(200, json={"access_token": "g-1", "refresh_token": "g-r", "expires_in": 3600, "scope": self.google_scope})
         if url == "https://oauth2.googleapis.com/revoke":
@@ -198,6 +204,22 @@ async def test_google(client, user, services):
     reply = (await client.post("/api/assistant/chat", json={"text": "купить хлеб послезавтра в 18:00"}, headers=headers)).json()
     await client.post(f"/api/assistant/drafts/{reply['draft_id']}/confirm", headers=headers)
     assert services.created["google"] == ["Купить хлеб"]
+
+
+async def test_expired_google_access_is_said_not_hidden(client, user, services):
+    from app.services.events import GOOGLE_ACCESS_LOST
+
+    headers, _ = user
+    await oauth_connect(client, headers, "google")
+    services.google_expired = True
+    reply = (await client.post("/api/assistant/chat", json={"text": "купить хлеб послезавтра в 18:00"}, headers=headers)).json()
+    confirmed = (await client.post(f"/api/assistant/drafts/{reply['draft_id']}/confirm", headers=headers)).json()
+    # The task is in Dayla, and the reply says why it is not in Google instead of claiming it is
+    assert services.created["google"] == [] and GOOGLE_ACCESS_LOST in json.dumps(confirmed, ensure_ascii=False)
+    item = await connection(client, headers, "google")
+    assert item["status"] == "error" and item["last_sync_error"] == GOOGLE_ACCESS_LOST
+    events = (await client.get("/api/events", params={"limit": 200}, headers=headers)).json()
+    assert next(event for event in events if event["title"] == "Купить хлеб")["sync_status"] == "error"
 
 
 async def test_disconnecting_google_revokes_its_access(client, user, services):

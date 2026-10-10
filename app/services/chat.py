@@ -15,7 +15,7 @@ from app.services import dates, tasks, usage
 from app.services.integrations import service as integrations
 from app.services.integrations.base import IntegrationError
 from app.services.integrations.registry import PROVIDERS
-from app.services.events import google_provider, remember_google_token, push_pending_to_google
+from app.services.events import GOOGLE_ACCESS_LOST, google_provider, push_pending_to_google, remember_google_token
 from app.services.ru import MONTHS, RELATIVE_DAYS, WEEKDAYS, day_label, plural
 
 logger = logging.getLogger(__name__)
@@ -971,7 +971,13 @@ async def export_to(session: AsyncSession, user: User, slug: str, events: list[E
     title = PROVIDERS[slug].title if slug in PROVIDERS else slug
     if slug == "google":
         # create_tasks has copied them already
-        return f"Не удалось добавить в {title}" if any(event.sync_status == "error" for event in events) else None
+        # Said only when Google really took every task: one not sent at all is not "added"
+        if all(event.sync_status == "synced" and event.external_id for event in events):
+            return None
+        integration = await session.scalar(select(Integration).where(Integration.user_id == user.id, Integration.provider == "google"))
+        if integration and integration.last_sync_error == GOOGLE_ACCESS_LOST:
+            return GOOGLE_ACCESS_LOST
+        return f"Не удалось добавить в {title}"
     integration = await session.scalar(select(Integration).where(Integration.user_id == user.id, Integration.provider == slug))
     if not integration:
         return f"{title} не подключён"

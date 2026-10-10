@@ -33,13 +33,35 @@ async def google_provider(session: AsyncSession, user_id: int) -> tuple[Integrat
     return integration, GoogleCalendarProvider(secrets["access_token"], secrets.get("refresh_token"))
 
 
+GOOGLE_ACCESS_LOST = "Доступ к Google Calendar истёк — подключите его заново"
+
+
+def access_lost(error: httpx.HTTPError) -> bool:
+    """Google refused the refresh token (revoked, or a week old while the Google app is in testing)."""
+    return isinstance(error, httpx.HTTPStatusError) and error.request.url.host == "oauth2.googleapis.com"
+
+
+def mark_access_lost(integration: Integration) -> None:
+    integration.status = "error"
+    integration.last_sync_error = GOOGLE_ACCESS_LOST
+
+
 def remember_google_token(integration: Integration, provider: GoogleCalendarProvider) -> None:
     store_secrets(integration, {"access_token": provider.access_token})
 
 
 async def push_new_events_to_google(session: AsyncSession, user_id: int, events: list[Event]) -> None:
     integration, provider = await google_provider(session, user_id)
-    if not provider or not events:
+    if not events:
+        return
+    if not provider:
+        if integration:
+            # Connected once, but there is no access to use: the reply must not say the tasks went to Google
+            logger.warning("Google is connected for user %s without an access token", user_id)
+            mark_access_lost(integration)
+            for event in events:
+                event.sync_status = "error"
+            await session.commit()
         return
     for event in events:
         try:
@@ -47,8 +69,16 @@ async def push_new_events_to_google(session: AsyncSession, user_id: int, events:
             event.external_id = result.get("id")
             event.sync_status = "synced"
             event.source = "google"
-        except httpx.HTTPError:
+            logger.info("Event %s of user %s created in Google as %s", event.id, user_id, event.external_id)
+        except httpx.HTTPError as error:
+            status = error.response.status_code if isinstance(error, httpx.HTTPStatusError) else None
+            logger.warning("Google did not accept event %s of user %s: %s", event.id, user_id, status or error)
             event.sync_status = "error"
+            if access_lost(error):
+                mark_access_lost(integration)
+                for rest in events:
+                    rest.sync_status = "error" if rest.sync_status != "synced" else rest.sync_status
+                break
     remember_google_token(integration, provider)
     await session.commit()
     for event in events:
