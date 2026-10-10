@@ -15,7 +15,7 @@ from app.services import dates, tasks, usage
 from app.services.integrations import service as integrations
 from app.services.integrations.base import IntegrationError
 from app.services.integrations.registry import PROVIDERS
-from app.services.events import google_provider, remember_google_token
+from app.services.events import google_provider, remember_google_token, push_pending_to_google
 from app.services.ru import MONTHS, RELATIVE_DAYS, WEEKDAYS, day_label, plural
 
 logger = logging.getLogger(__name__)
@@ -1053,6 +1053,7 @@ async def apply_changes(session: AsyncSession, user: User, items: list[dict], tz
             event.sync_status = "pending"
         changed.append(event)
     await session.commit()
+    await push_pending_to_google(session, user.id)
     for event in changed:
         await session.refresh(event)
     return changed

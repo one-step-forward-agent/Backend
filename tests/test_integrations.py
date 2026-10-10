@@ -28,6 +28,10 @@ class FakeServices:
         self.atlassian_profile = True
         self.google_profile = {"sub": "g-olga", "email": "olga@gmail.com", "email_verified": True, "name": "Ольга"}
         self.jira_token = "j-1"
+        # The Google event as Google keeps it; PATCH changes it unless google_patch_status says otherwise
+        self.google_start = datetime.combine(TOMORROW, time(10), TZ)
+        self.google_patches: list[dict] = []
+        self.google_patch_status = 200
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         url, method = str(request.url).split("?")[0], request.method
@@ -44,8 +48,13 @@ class FakeServices:
             if method == "POST":
                 self.created["google"].append(body["summary"])
                 return httpx.Response(200, json={"id": f"g-new-{len(self.created['google'])}", "htmlLink": "https://calendar.google.com/x"})
-            start = datetime.combine(TOMORROW, time(10), TZ)
+            start = self.google_start
             return httpx.Response(200, json={"items": [{"id": "g-ev-1", "summary": "Стендап в Google", "start": {"dateTime": start.isoformat()}, "end": {"dateTime": (start + timedelta(hours=1)).isoformat()}}]})
+        if url == "https://www.googleapis.com/calendar/v3/calendars/primary/events/g-ev-1" and method == "PATCH":
+            self.google_patches.append(body)
+            if self.google_patch_status == 200:
+                self.google_start = datetime.fromisoformat(body["start"]["dateTime"])
+            return httpx.Response(self.google_patch_status, json={"id": "g-ev-1"})
         # Notion
         if url == "https://api.notion.com/v1/oauth/token":
             assert request.headers["Authorization"] == "Basic " + base64.b64encode(b"n-client:n-secret").decode()
@@ -183,6 +192,44 @@ async def test_google(client, user, services):
     reply = (await client.post("/api/assistant/chat", json={"text": "купить хлеб послезавтра в 18:00"}, headers=headers)).json()
     await client.post(f"/api/assistant/drafts/{reply['draft_id']}/confirm", headers=headers)
     assert services.created["google"] == ["Купить хлеб"]
+
+
+async def google_standup(client, headers) -> dict:
+    start = datetime.combine(datetime.now(TZ).date() - timedelta(days=1), time.min, TZ)
+    events = (await client.get("/api/events", params={"start": start.isoformat(), "limit": 200}, headers=headers)).json()
+    return next(event for event in events if event["title"] == "Стендап в Google")
+
+
+async def test_moving_a_google_event_changes_it_in_google(client, user, services):
+    headers, _ = user
+    await oauth_connect(client, headers, "google")
+    event = await google_standup(client, headers)
+    later = TOMORROW + timedelta(days=1)
+    moved = await client.post(f"/api/assistant/events/{event['id']}/move", json={"date": later.isoformat()}, headers=headers)
+    assert moved.status_code == 200, moved.text
+    # Only the title and the time are sent: guests and links in Google stay
+    assert len(services.google_patches) == 1 and set(services.google_patches[0]) == {"summary", "start", "end"}
+    assert services.google_start.date() == later
+    await client.post("/api/integrations/google/sync", headers=headers)
+    event = await google_standup(client, headers)
+    assert datetime.fromisoformat(event["start_at"]).astimezone(TZ).date() == later and event["sync_status"] == "synced"
+
+
+async def test_a_change_google_refused_is_not_undone_by_the_import(client, user, services):
+    headers, _ = user
+    await oauth_connect(client, headers, "google")
+    event = await google_standup(client, headers)
+    later = TOMORROW + timedelta(days=2)
+    services.google_patch_status = 503
+    await client.post(f"/api/assistant/events/{event['id']}/move", json={"date": later.isoformat()}, headers=headers)
+    await client.post("/api/integrations/google/sync", headers=headers)
+    event = await google_standup(client, headers)
+    assert datetime.fromisoformat(event["start_at"]).astimezone(TZ).date() == later and event["sync_status"] == "pending"
+    # Google is back: the next sync sends the change first
+    services.google_patch_status = 200
+    await client.post("/api/integrations/google/sync", headers=headers)
+    assert services.google_start.date() == later
+    assert (await google_standup(client, headers))["sync_status"] == "synced"
 
 
 async def test_notion(client, user, services):

@@ -1,3 +1,5 @@
+import logging
+
 import httpx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -6,6 +8,8 @@ from app.models.models import Calendar, Event, Integration, User
 from app.services.google_calendar import GoogleCalendarProvider
 from app.services.integrations.google import google_event_body
 from app.services.integrations.service import event_payload, integration_secrets, store_secrets
+
+logger = logging.getLogger(__name__)
 
 
 async def default_calendar(session: AsyncSession, user: User, timezone_name: str) -> Calendar:
@@ -49,3 +53,34 @@ async def push_new_events_to_google(session: AsyncSession, user_id: int, events:
     await session.commit()
     for event in events:
         await session.refresh(event)
+
+
+async def push_pending_to_google(session: AsyncSession, user_id: int) -> None:
+    """Send the Google events changed in Dayla (moved, renamed, new time) back to Google Calendar.
+
+    Without it the next import brings Google's old version back and the change is lost. An event Google
+    refused stays "pending": the import leaves it alone and the next change or sync tries again."""
+    events = list(
+        await session.scalars(
+            select(Event).where(Event.user_id == user_id, Event.source == "google", Event.external_id.is_not(None), Event.sync_status == "pending")
+        )
+    )
+    if not events:
+        return
+    integration, provider = await google_provider(session, user_id)
+    if not provider:
+        return
+    for event in events:
+        body = google_event_body(event_payload(event))
+        try:
+            await provider.patch_event("primary", event.external_id, {key: body[key] for key in ("summary", "start", "end")})
+            event.sync_status = "synced"
+        except httpx.HTTPStatusError as error:
+            if error.response.status_code in (404, 410):
+                # Deleted in Google: the import no longer brings it back, the Dayla copy keeps the change
+                event.sync_status = "error"
+            logger.warning("Google refused the change of event %s: %s", event.id, error.response.status_code)
+        except httpx.HTTPError:
+            logger.warning("Could not send the change of event %s to Google", event.id)
+    remember_google_token(integration, provider)
+    await session.commit()

@@ -97,6 +97,11 @@ async def verify_integration(session: AsyncSession, user: User, integration: Int
 
 
 async def sync_integration(session: AsyncSession, user: User, integration: Integration) -> dict:
+    if integration.provider == "google":
+        from app.services.events import push_pending_to_google
+
+        # Changes made in Dayla go to Google first, so the import below does not undo them
+        await push_pending_to_google(session, user.id)
     tz = user_timezone(user)
     provider = build_provider(integration, tz)
     now = datetime.now(timezone.utc)
@@ -124,6 +129,10 @@ async def sync_integration(session: AsyncSession, user: User, integration: Integ
             event = Event(calendar_id=calendar.id, user_id=user.id, external_id=external_id, source=integration.provider)
             session.add(event)
             created += 1
+        elif event.sync_status == "pending" and integration.provider == "google":
+            # Changed in Dayla and not accepted by the calendar yet: the local version wins until it is sent
+            skipped += 1
+            continue
         else:
             updated += 1
         event.title = item.title[:300]

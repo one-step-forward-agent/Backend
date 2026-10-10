@@ -53,5 +53,9 @@ class GoogleCalendarProvider(CalendarProvider):
     async def update_event(self, calendar_id: str, event_id: str, event: dict[str, Any]) -> dict[str, Any]:
         return await self._request("PUT", f"{self.base_url}/calendars/{calendar_id}/events/{event_id}", json=event) or {}
 
+    async def patch_event(self, calendar_id: str, event_id: str, fields: dict[str, Any]) -> dict[str, Any]:
+        """Change only `fields`: guests, video links and Google's own reminders stay as they are."""
+        return await self._request("PATCH", f"{self.base_url}/calendars/{calendar_id}/events/{event_id}", json=fields) or {}
+
     async def delete_event(self, calendar_id: str, event_id: str) -> None:
         await self._request("DELETE", f"{self.base_url}/calendars/{calendar_id}/events/{event_id}")

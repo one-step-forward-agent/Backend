@@ -45,7 +45,7 @@ from app.schemas import (
 from app.services import chat, insights, tasks, usage
 from app.services.dates import valid_rrule
 from app.services.ru import plural
-from app.services.events import default_calendar, google_provider, push_new_events_to_google, remember_google_token
+from app.services.events import default_calendar, google_provider, push_new_events_to_google, push_pending_to_google, remember_google_token
 from app.services.integrations.google import google_event_body
 from app.services.integrations.service import event_payload
 
@@ -228,6 +228,7 @@ async def update_event(event_id: int, payload: EventUpdate, user: User = Depends
         raise HTTPException(status_code=422, detail="end_at must be later than start_at")
     event.sync_status = "pending"
     await session.commit()
+    await push_pending_to_google(session, user.id)
     await session.refresh(event)
     return event
 
