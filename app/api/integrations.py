@@ -8,6 +8,7 @@ from app.core.crypto import decrypt_json, encrypt_json
 from app.core.database import get_session
 from app.models.models import Calendar, Event, EventLink, Integration, User
 from app.schemas import EventLinkRead, IntegrationConnect, IntegrationRead
+from app.services.google_calendar import revoke_google_access
 from app.services.integrations import service
 from app.services.integrations.base import IntegrationError, ProviderContext
 from app.services.integrations.registry import PROVIDERS
@@ -109,6 +110,8 @@ async def disconnect_integration(slug: str, purge: bool = False, user: User = De
         calendar_ids = select(Calendar.id).where(Calendar.user_id == user.id, Calendar.provider == slug)
         await session.execute(delete(Event).where(Event.user_id == user.id, Event.calendar_id.in_(calendar_ids)))
         await session.execute(delete(Calendar).where(Calendar.id.in_(calendar_ids)))
+    if slug == "google":
+        await revoke_google_access(service.integration_secrets(integration))
     await session.delete(integration)
     await session.commit()
 

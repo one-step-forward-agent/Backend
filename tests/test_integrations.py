@@ -27,6 +27,9 @@ class FakeServices:
         self.created: dict[str, list] = {"google": [], "notion": [], "apple": []}
         self.atlassian_profile = True
         self.google_profile = {"sub": "g-olga", "email": "olga@gmail.com", "email_verified": True, "name": "Ольга"}
+        # What the user allowed on Google's consent page; Google lets them untick the calendar
+        self.google_scope = "openid https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/calendar.calendarlist.readonly"
+        self.revoked: list[str] = []
         self.jira_token = "j-1"
         # The Google event as Google keeps it; PATCH changes it unless google_patch_status says otherwise
         self.google_start = datetime.combine(TOMORROW, time(10), TZ)
@@ -39,7 +42,10 @@ class FakeServices:
         body = json.loads(request.content) if request.content and request.headers.get("content-type", "").startswith("application/json") else None
         # Google
         if url == "https://oauth2.googleapis.com/token":
-            return httpx.Response(200, json={"access_token": "g-1", "refresh_token": "g-r", "expires_in": 3600})
+            return httpx.Response(200, json={"access_token": "g-1", "refresh_token": "g-r", "expires_in": 3600, "scope": self.google_scope})
+        if url == "https://oauth2.googleapis.com/revoke":
+            self.revoked.append(parse_qs(request.content.decode())["token"][0])
+            return httpx.Response(200)
         if url == "https://openidconnect.googleapis.com/v1/userinfo":
             return httpx.Response(200, json=self.google_profile)
         if url == "https://www.googleapis.com/calendar/v3/users/me/calendarList":
@@ -192,6 +198,29 @@ async def test_google(client, user, services):
     reply = (await client.post("/api/assistant/chat", json={"text": "купить хлеб послезавтра в 18:00"}, headers=headers)).json()
     await client.post(f"/api/assistant/drafts/{reply['draft_id']}/confirm", headers=headers)
     assert services.created["google"] == ["Купить хлеб"]
+
+
+async def test_disconnecting_google_revokes_its_access(client, user, services):
+    headers, _ = user
+    await oauth_connect(client, headers, "google")
+    assert (await client.delete("/api/integrations/google", headers=headers)).status_code == 204
+    assert services.revoked == ["g-r"]
+    await oauth_connect(client, headers, "google")
+    assert (await client.post("/auth/google/disconnect", headers=headers)).status_code == 200
+    assert services.revoked == ["g-r", "g-r"]
+    assert (await connection(client, headers, "google")) is None
+
+
+async def test_deleting_the_account_deletes_its_data_and_revokes_google(client, user, services):
+    headers, _ = user
+    await oauth_connect(client, headers, "google")
+    event = (await google_standup(client, headers))["id"]
+    uploaded = await client.post(f"/api/events/{event}/files", files={"file": ("plan.pdf", b"%PDF-1.4", "application/pdf")}, headers=headers)
+    assert uploaded.status_code == 201, uploaded.text
+    deleted = await client.delete("/api/me", headers=headers)
+    assert deleted.status_code == 204 and services.revoked == ["g-r"]
+    assert not (auth.settings.storage_path / "events" / str(event)).exists()
+    assert (await client.get("/api/me", headers=headers)).status_code == 401
 
 
 async def google_standup(client, headers) -> dict:

@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime
 from typing import Any
 
@@ -5,6 +6,31 @@ import httpx
 
 from app.core.config import settings
 from app.services.calendar_provider import CalendarProvider
+
+logger = logging.getLogger(__name__)
+
+# The narrowest scopes Dayla works with: events of the user's calendars (read, create, change, delete) and the
+# list of calendars to choose from. Not the whole `calendar` scope: Dayla never changes calendars or their sharing.
+CALENDAR_SCOPES = (
+    "https://www.googleapis.com/auth/calendar.events",
+    "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
+)
+
+
+async def revoke_google_access(secrets: dict) -> None:
+    """Withdraw Dayla's access in the Google account itself, not only forget the tokens: disconnecting and deleting
+    the account must leave Google without a grant to Dayla. Revoking the refresh token revokes the whole grant."""
+    token = secrets.get("refresh_token") or secrets.get("access_token")
+    if not token:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.post("https://oauth2.googleapis.com/revoke", data={"token": token})
+        # 400: already revoked or expired, nothing left to withdraw
+        if response.is_error and response.status_code != 400:
+            logger.warning("Google did not revoke a token: %s", response.status_code)
+    except httpx.HTTPError as error:
+        logger.warning("Google token revocation failed: %s", error)
 
 
 class GoogleCalendarProvider(CalendarProvider):

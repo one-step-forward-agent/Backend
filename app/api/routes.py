@@ -1,4 +1,5 @@
 import hashlib
+import shutil
 import subprocess
 from pathlib import Path
 from datetime import date, datetime, timedelta
@@ -9,10 +10,10 @@ import httpx
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response
-from sqlalchemy import any_, func, select, update
+from sqlalchemy import any_, delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_current_user
+from app.api.deps import ACCESS_COOKIE, REFRESH_COOKIE, get_current_user
 from app.core import ratelimit
 from app.core.config import settings
 from app.core.database import get_session
@@ -45,9 +46,10 @@ from app.schemas import (
 from app.services import chat, insights, tasks, usage
 from app.services.dates import valid_rrule
 from app.services.ru import plural
+from app.services.google_calendar import revoke_google_access
 from app.services.events import default_calendar, google_provider, push_new_events_to_google, push_pending_to_google, remember_google_token
 from app.services.integrations.google import google_event_body
-from app.services.integrations.service import event_payload
+from app.services.integrations.service import event_payload, integration_secrets
 
 router = APIRouter(prefix="/api")
 
@@ -131,6 +133,24 @@ async def update_current_user(payload: UserUpdate, user: User = Depends(get_curr
     await session.commit()
     await session.refresh(user)
     return user
+
+
+@router.delete("/me", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_current_user(user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    """Delete the account and everything in it: events, files, chat, integrations. Google's access is revoked
+    in the Google account too. The rows go by the database's ON DELETE CASCADE."""
+    google = await session.scalar(select(Integration).where(Integration.user_id == user.id, Integration.provider == "google"))
+    if google:
+        await revoke_google_access(integration_secrets(google))
+    event_ids = list(await session.scalars(select(Event.id).where(Event.user_id == user.id)))
+    await session.execute(delete(User).where(User.id == user.id))
+    await session.commit()
+    for event_id in event_ids:
+        shutil.rmtree(settings.storage_path / "events" / str(event_id), ignore_errors=True)
+    response = Response(status_code=status.HTTP_204_NO_CONTENT)
+    response.delete_cookie(ACCESS_COOKIE)
+    response.delete_cookie(REFRESH_COOKIE, path="/auth")
+    return response
 
 
 @router.put("/me/onboarding", response_model=UserRead)

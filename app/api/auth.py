@@ -21,6 +21,7 @@ from app.core.config import settings
 from app.core.database import get_session
 from app.core.dataenc import email_lookup
 from app.models.models import Calendar, Integration, RefreshToken, User, UserIdentity
+from app.services.google_calendar import CALENDAR_SCOPES, revoke_google_access
 from app.services.integrations import service as integration_service
 from app.services.integrations.service import integration_secrets, store_secrets
 from app.schemas import LoginRequest, OAuthStart, RefreshRequest, RegisterRequest, TokenResponse
@@ -276,7 +277,7 @@ def google_authorization_url(user_id: int, return_to: str | None = None, mode: s
         "client_id": settings.google_client_id,
         "redirect_uri": settings.google_redirect_uri,
         "response_type": "code",
-        "scope": "openid email profile https://www.googleapis.com/auth/calendar",
+        "scope": " ".join(("openid", "email", "profile", *CALENDAR_SCOPES)),
         "access_type": "offline",
         "prompt": "select_account consent",
         "state": _oauth_state(user_id, return_to, mode, tz),
@@ -454,19 +455,24 @@ async def _callback_user(session: AsyncSession, entry: dict, provider: str, subj
     return user
 
 
-async def _finish_callback(session: AsyncSession, entry: dict, user_id: int, provider: str) -> RedirectResponse:
-    """The redirect back to the site; signing up or logging in also starts the Dayla session."""
+async def _finish_callback(session: AsyncSession, entry: dict, user_id: int, provider: str, error: str | None = None) -> RedirectResponse:
+    """The redirect back to the site; signing up or logging in also starts the Dayla session.
+    `error`: the account is there, but the service was not connected — the page shows why."""
     return_to = entry["return_to"]
+    result = urlencode({"error": error}) if error else f"connected={provider}"
     if entry["mode"] == "login":
         response = RedirectResponse(url=return_to or "/app", status_code=303)
     elif return_to:
         separator = "&" if "?" in return_to else "?"
-        response = RedirectResponse(url=f"{return_to}{separator}connected={provider}", status_code=303)
+        response = RedirectResponse(url=f"{return_to}{separator}{result}", status_code=303)
     else:
-        response = RedirectResponse(url=f"/?connected={provider}", status_code=303)
+        response = RedirectResponse(url=f"/?{result}", status_code=303)
     if entry["mode"] != "connect":
         _set_session_cookies(response, await _issue_tokens(session, user_id))
     return response
+
+
+CALENDAR_NOT_GRANTED = "Google Calendar не подключён: на странице Google отметьте доступ к календарю и попробуйте ещё раз"
 
 
 @google_router.get("/callback")
@@ -518,6 +524,11 @@ async def google_callback(
     if entry["mode"] == "login":
         await session.commit()
         return await _finish_callback(session, entry, user_id, "google")
+    # Google lets the user untick the calendar on its consent page: then there is no calendar to connect
+    if not set(CALENDAR_SCOPES) <= set(token_data.get("scope", "").split()):
+        await session.commit()
+        await revoke_google_access(token_data)
+        return await _finish_callback(session, entry, user_id, "google", error=CALENDAR_NOT_GRANTED)
     integration = await session.scalar(
         select(Integration).where(Integration.user_id == user_id, Integration.provider == "google")
     )
@@ -864,6 +875,7 @@ async def google_disconnect(user: User = Depends(get_current_user), session: Asy
         select(Integration).where(Integration.user_id == user.id, Integration.provider == "google")
     )
     if integration:
+        await revoke_google_access(integration_secrets(integration))
         await session.delete(integration)
         await session.commit()
     return {"status": "disconnected"}

@@ -56,7 +56,8 @@ def redirect(response: httpx.Response) -> tuple[str, dict]:
 
 async def test_sign_up_with_google_creates_the_account_and_connects_the_calendar(browser, services, google_account):
     query = await start(browser, "signup", consent=True, return_to=ONBOARDING, timezone="Asia/Yekaterinburg")
-    assert "calendar" in query["scope"][0]
+    # Only events and the list of calendars, not the whole Google Calendar scope
+    assert query["scope"] == ["openid email profile https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/calendar.calendarlist.readonly"]
     response = await callback(browser, query)
     assert response.headers["location"] == f"{ONBOARDING}?connected=google"
     headers = session_headers(response)
@@ -121,3 +122,14 @@ async def test_unverified_google_email_does_not_create_an_account(browser, servi
     path, params = redirect(response)
     assert path == "/register" and "подтверждённый email" in params["error"]
     assert ACCESS_COOKIE not in response.headers.get("set-cookie", "")
+
+
+async def test_calendar_unticked_on_google_page_signs_up_without_connecting_it(browser, services, google_account):
+    services.google_scope = "openid https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile"
+    response = await callback(browser, await start(browser, "signup", consent=True, return_to=ONBOARDING))
+    path, params = redirect(response)
+    assert path == ONBOARDING and "отметьте доступ к календарю" in params["error"]
+    headers = session_headers(response)
+    assert (await browser.get("/api/me", headers=headers)).json()["email"] == google_account
+    listed = {item["slug"]: item for item in (await browser.get("/api/integrations", headers=headers)).json()}
+    assert listed["google"]["connection"] is None and services.revoked == ["g-r"]
