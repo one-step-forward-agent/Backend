@@ -58,6 +58,10 @@ ENCRYPTED_COLUMNS = (
     ("recommendation_cache", "items", "json"),
     ("tags", "name", "text"),
     ("admin_notes", "text", "text"),
+    ("notifications", "payload", "json"),
+    ("notifications", "error", "text"),
+    ("integrations", "config", "json"),
+    ("integrations", "last_sync_error", "text"),
 )
 UNREADABLE = "[не удалось расшифровать]"
 

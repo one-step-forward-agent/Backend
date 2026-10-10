@@ -1,11 +1,14 @@
 """The admin dashboard (dayla.tech/dashboard): every table of the database as a sheet, and the admins' shared note.
 
-Only users with users.is_admin. The rows go to the browser as they are (decrypted); sorting, filters, column
-functions, combining sheets and CSV export happen there. Never sent: secrets (password hashes, integration
-tokens, link codes) and content that came from Google — Google's API Services User Data Policy and our privacy
-policy promise that people do not read it.
+Only users with users.is_admin. Sorting, filters, column functions, combining sheets and CSV export happen in the
+browser. What reaches it is depersonalized: secrets are never sent, and every personal or content value (names,
+emails, task titles, reminders, chat messages, account ids…) becomes a pseudonym — the same value always gives the
+same one, so COUNT DISTINCT, UNIQUE and joins still work, but it cannot be turned back into the value.
 """
 
+import hashlib
+import hmac
+import json
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
@@ -18,8 +21,9 @@ from sqlalchemy.dialects.postgresql import JSONB, insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
+from app.core.config import settings
 from app.core.database import Base, get_session
-from app.core.dataenc import EncryptedJSON
+from app.core.dataenc import ENCRYPTED_COLUMNS, EncryptedJSON
 from app.models.models import AdminNote, User
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
@@ -30,12 +34,20 @@ HIDDEN_COLUMNS = {
     "integrations": {"credentials_encrypted"},
     "refresh_tokens": {"jti"},
 }
-# Columns holding what Google gave, and the rows where it came from Google
-GOOGLE_CONTENT = {
-    "events": (("title", "description", "location"), lambda row: row.get("source") == "google"),
-    "calendars": (("name", "description"), lambda row: row.get("provider") == "google"),
+# Shown as pseudonyms: everything stored encrypted, and the plain ids that point at a person or their accounts
+PERSONAL = {(table, column) for table, column, _kind in ENCRYPTED_COLUMNS} | {
+    ("users", "telegram_chat_id"),
+    ("user_identities", "subject"),
+    ("calendars", "external_id"),
+    ("events", "external_id"),
+    ("event_links", "external_id"),
+    ("event_links", "url"),
+    ("event_files", "stored_filename"),
+    ("event_files", "storage_path"),
 }
-GOOGLE_HIDDEN = "[данные Google скрыты]"
+# The mail provider stays: gmail.com or yandex.ru is analytics, the mailbox is a person
+EMAILS = {("users", "email"), ("integrations", "account_email")}
+PSEUDONYM_KEY = hashlib.sha256(f"dayla-admin-pseudonym:{settings.secret_key}".encode()).digest()
 # A sheet is held in the browser: more rows than this are cut, and the sheet says so
 MAX_ROWS = 20000
 NOTE_ID = 1
@@ -71,6 +83,16 @@ def _kind(column) -> str:
     return "text"
 
 
+def pseudonym(value: Any, email: bool = False) -> str:
+    """A keyed hash: equal values give equal pseudonyms, and without the server's key they cannot be guessed back
+    even for short values (a name, a chat id)."""
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, sort_keys=True)
+    token = "◆" + hmac.new(PSEUDONYM_KEY, text.strip().lower().encode() if email else text.encode(), hashlib.sha256).hexdigest()[:10]
+    if email and "@" in text:
+        return f"{token}@{text.rsplit('@', 1)[1].strip().lower()}"
+    return token
+
+
 def _columns(table: Table) -> list:
     hidden = HIDDEN_COLUMNS.get(table.name, set())
     return [column for column in table.columns if column.name not in hidden]
@@ -82,7 +104,7 @@ def _describe(table: Table, rows: int) -> dict:
     return {
         "name": table.name,
         "rows": rows,
-        "columns": [{"name": column.name, "type": _kind(column)} for column in columns],
+        "columns": [{"name": column.name, "type": "text" if (table.name, column.name) in PERSONAL else _kind(column)} for column in columns],
         # How sheets combine: this column points at that table's column
         "foreign_keys": [
             {"column": fk.parent.name, "table": fk.column.table.name, "target": fk.column.name}
@@ -124,15 +146,17 @@ async def read_table(name: str, _: User = Depends(get_admin), session: AsyncSess
     total = await session.scalar(select(func.count()).select_from(table)) or 0
     order = list(table.primary_key.columns) or columns[:1]
     records = (await session.execute(select(*columns).order_by(*order).limit(MAX_ROWS))).mappings().all()
-    google = GOOGLE_CONTENT.get(name)
+    masked = {column.name for column in columns if (name, column.name) in PERSONAL}
     rows = []
     for record in records:
-        row = dict(record)
-        if google and google[1](row):
-            for column in google[0]:
-                if row.get(column) is not None:
-                    row[column] = GOOGLE_HIDDEN
-        rows.append([_plain(row[column.name]) for column in columns])
+        rows.append(
+            [
+                pseudonym(record[column.name], email=(name, column.name) in EMAILS)
+                if column.name in masked and record[column.name] not in (None, "", {}, [])
+                else _plain(record[column.name])
+                for column in columns
+            ]
+        )
     return {**_describe(table, total), "data": rows, "truncated": total > len(rows)}
 
 

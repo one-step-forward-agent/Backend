@@ -87,3 +87,28 @@ async def test_user_model_keeps_email_hash_in_sync():
         assert found and found.email == "sync@example.com"
         await session.delete(found)
         await session.commit()
+
+
+async def test_reminders_and_integration_details_are_ciphertext(client, user):
+    from datetime import datetime, timedelta, timezone
+
+    from app.models.models import Integration, Notification
+    from app.services import reminders
+
+    headers, chat_id = user
+    me = (await client.get("/api/me", headers=headers)).json()
+    async with session_factory() as session:
+        owner = await session.get(User, me["id"])
+        reminder = await reminders.create_custom(session, owner, "выпить таблетки от давления", datetime.now(timezone.utc) + timedelta(hours=1))
+        session.add(Integration(user_id=owner.id, provider="jira", config={"email": "anna@corp.ru", "site": "anna.atlassian.net"}, last_sync_error="Аккаунт anna@corp.ru отклонил доступ"))
+        await session.commit()
+        reminder_id = reminder.id
+    async with session_factory() as session:
+        payload, error = (await session.execute(text("SELECT payload, error FROM notifications WHERE id = :id"), {"id": reminder_id})).one()
+        config, sync_error = (await session.execute(text("SELECT config, last_sync_error FROM integrations WHERE user_id = :id AND provider = 'jira'"), {"id": me["id"]})).one()
+        assert payload.startswith("enc:v1:") and "таблетки" not in payload and error is None
+        assert config.startswith("enc:v1:") and sync_error.startswith("enc:v1:") and "anna" not in config + sync_error
+        # Read through the models, they are plain again
+        assert (await session.get(Notification, reminder_id)).payload == {"text": "Выпить таблетки от давления"}
+        stored = await session.scalar(select(Integration).where(Integration.user_id == me["id"], Integration.provider == "jira"))
+        assert stored.config["email"] == "anna@corp.ru" and "anna@corp.ru" in stored.last_sync_error

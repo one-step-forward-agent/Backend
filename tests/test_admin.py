@@ -4,7 +4,7 @@ that one admin at a time edits after locking it."""
 import uuid
 
 from app.core import make_admin
-from app.api.admin import GOOGLE_HIDDEN
+from app.api.admin import pseudonym
 from tests.test_integrations import oauth_connect, services  # noqa: F401 - services is a fixture
 
 
@@ -27,7 +27,7 @@ async def test_only_admins_open_the_dashboard(client):
     assert (await client.get("/api/admin/tables")).status_code == 401
 
 
-async def test_tables_without_secrets_or_google_content(client, services):
+async def test_tables_are_depersonalized(client, services):
     headers, email = await account(client, "admin", admin=True)
     assert (await client.get("/api/me", headers=headers)).json()["is_admin"] is True
     # Created before Google is connected, the task stays Dayla's own; with Google it would go there too
@@ -37,21 +37,27 @@ async def test_tables_without_secrets_or_google_content(client, services):
     tables = {table["name"]: table for table in (await client.get("/api/admin/tables", headers=headers)).json()}
     assert "admin_notes" not in tables and {"users", "events", "integrations", "llm_usage"} <= set(tables)
     users = {column["name"]: column["type"] for column in tables["users"]["columns"]}
-    assert users["id"] == "number" and users["created_at"] == "datetime" and users["profile"] == "json"
+    assert users["id"] == "number" and users["created_at"] == "datetime" and users["profile"] == "text"
     assert not {"password_hash", "email_hash", "telegram_link_code"} & set(users)
     assert "credentials_encrypted" not in {column["name"] for column in tables["integrations"]["columns"]}
     assert {"column": "user_id", "table": "users", "target": "id"} in tables["events"]["foreign_keys"]
 
+    # Names, emails and chat ids are pseudonyms; the mail provider stays
+    assert users["email"] == "text" and users["telegram_chat_id"] == "text"
     sheet = (await client.get("/api/admin/tables/users", headers=headers)).json()
     names = [column["name"] for column in sheet["columns"]]
-    assert email in [row[names.index("email")] for row in sheet["data"]] and sheet["truncated"] is False
+    me = (await client.get("/api/me", headers=headers)).json()["id"]
+    row = next(row for row in sheet["data"] if row[names.index("id")] == me)
+    assert row[names.index("email")] == pseudonym(email, email=True) and row[names.index("email")].endswith("@example.com")
+    assert row[names.index("name")] == pseudonym("admin") and "admin" not in row[names.index("name")]
+    assert sheet["truncated"] is False
 
     events = (await client.get("/api/admin/tables/events", headers=headers)).json()
     names = [column["name"] for column in events["columns"]]
-    me = (await client.get("/api/me", headers=headers)).json()["id"]
-    mine = {row[names.index("title")]: row[names.index("source")] for row in events["data"] if row[names.index("user_id")] == me}
-    # The event imported from Google keeps its times and ids; its title, description and place are not shown
-    assert mine == {GOOGLE_HIDDEN: "google", "Купить хлеб": "local"}
+    mine = {row[names.index("source")]: row[names.index("title")] for row in events["data"] if row[names.index("user_id")] == me}
+    # Titles are pseudonyms, Google's and Dayla's alike: the same title gives the same pseudonym
+    assert mine == {"google": pseudonym("Стендап в Google"), "local": pseudonym("Купить хлеб")}
+    assert "Купить хлеб" not in str(events["data"]) and "Стендап" not in str(events["data"])
     assert (await client.get("/api/admin/tables/admin_notes", headers=headers)).status_code == 404
 
 

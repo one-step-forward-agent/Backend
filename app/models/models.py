@@ -188,11 +188,12 @@ class Integration(Base):
     provider: Mapped[str] = mapped_column(String(30))
     account_email: Mapped[str | None] = mapped_column(EncryptedText("integrations.account_email"))
     credentials_encrypted: Mapped[str | None] = mapped_column(Text)
-    config: Mapped[dict] = mapped_column(JSONB, default=dict)
+    # Logins, emails and addresses of the connected accounts
+    config: Mapped[dict] = mapped_column(EncryptedJSON("integrations.config"), default=dict)
     token_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     status: Mapped[str] = mapped_column(String(20), default="connected")
     last_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    last_sync_error: Mapped[str | None] = mapped_column(Text)
+    last_sync_error: Mapped[str | None] = mapped_column(EncryptedText("integrations.last_sync_error"))
     user: Mapped[User] = relationship(back_populates="integrations")
     calendars: Mapped[list[Calendar]] = relationship(back_populates="integration")
 
@@ -244,9 +245,10 @@ class Notification(Base):
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    error: Mapped[str | None] = mapped_column(Text)
+    error: Mapped[str | None] = mapped_column(EncryptedText("notifications.error"))
     # Data for the bot's buttons, e.g. the tasks a midday check-in suggests moving
-    payload: Mapped[dict | None] = mapped_column(JSONB)
+    # A custom reminder's own text, the tasks a check-in offers to move
+    payload: Mapped[dict | None] = mapped_column(EncryptedJSON("notifications.payload"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
