@@ -94,6 +94,8 @@ class Settings:
     telegram_bot_username: str | None = os.getenv("TELEGRAM_BOT_USERNAME")
     telegram_bot_token: str | None = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TOKEN")
     default_timezone: str = os.getenv("DEFAULT_TIMEZONE", "Europe/Moscow")
+    # Accounts made admins (dayla.tech/dashboard) on every start; removing one from the list does not revoke it
+    admin_emails: tuple[str, ...] = _list("ADMIN_EMAILS")
     enable_docs: bool = _bool("ENABLE_DOCS", not _is_production())
     allow_private_integration_urls: bool = _bool("ALLOW_PRIVATE_INTEGRATION_URLS", not _is_production())
     # GigaChat uses the Russian Trusted Root CA (Минцифры); the certificate ships in backend/certs

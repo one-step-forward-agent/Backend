@@ -81,3 +81,11 @@ async def test_note_is_edited_by_one_admin_at_a_time(client):
     assert stale.status_code == 409 and "уже изменили" in stale.json()["detail"]
     released = (await client.post("/api/admin/notes/unlock", headers=ivan)).json()
     assert not released["locked"] and released["text"] == "Созвон в пятницу"
+
+
+async def test_admin_emails_make_existing_accounts_admins(client):
+    headers, email = await account(client, "olga", admin=False)
+    # Upper case and an address with no account yet: the account still gets it, the missing one is skipped
+    await make_admin.grant_listed((email.upper(), f"nobody-{uuid.uuid4().hex[:8]}@example.com"))
+    assert (await client.get("/api/me", headers=headers)).json()["is_admin"] is True
+    assert (await client.get("/api/admin/tables", headers=headers)).status_code == 200

@@ -1,10 +1,11 @@
 """Give a user the admin dashboard (dayla.tech/dashboard): `python -m app.core.make_admin <email>`.
 
 `--revoke` takes it away. Emails are encrypted, so a plain UPDATE by email does not work; this finds the user
-by the email's hash.
+by the email's hash. Where no shell is at hand (Amvera), the ADMIN_EMAILS variable does the same on every start.
 """
 
 import asyncio
+import logging
 import sys
 
 from sqlalchemy import select
@@ -12,6 +13,23 @@ from sqlalchemy import select
 from app.core.database import session_factory
 from app.core.dataenc import email_lookup
 from app.models.models import User
+
+logger = logging.getLogger(__name__)
+
+
+async def grant_listed(emails: tuple[str, ...]) -> None:
+    """ADMIN_EMAILS: only accounts that already exist. One not registered yet is not reserved for whoever signs up
+    with that email first: it becomes admin at the first start after it exists."""
+    if not emails:
+        return
+    async with session_factory() as session:
+        for email in emails:
+            user = await session.scalar(select(User).where(User.email_hash.in_(email_lookup(email))))
+            if user:
+                user.is_admin = True
+            else:
+                logger.warning("ADMIN_EMAILS: no account with %s yet", email)
+        await session.commit()
 
 
 async def main(email: str, admin: bool) -> int:

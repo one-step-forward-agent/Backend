@@ -11,6 +11,7 @@ from app.api.routes import router
 from app.core import errors, ratelimit
 from app.core.config import settings
 from app.core.database import engine
+from app.core.make_admin import grant_listed
 from app.models import models  # noqa: F401
 
 settings.validate()
@@ -28,6 +29,7 @@ WRITES_PER_IP_PER_MINUTE = 120
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     settings.storage_path.mkdir(parents=True, exist_ok=True)
+    await grant_listed(settings.admin_emails)
     yield
     await engine.dispose()
 
