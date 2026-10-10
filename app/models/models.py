@@ -54,6 +54,8 @@ class User(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     password_hash: Mapped[str | None] = mapped_column(String(255))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    # Opens dayla.tech/dashboard; granted with `python -m app.core.make_admin <email>`
+    is_admin: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     timezone: Mapped[str | None] = mapped_column(Text)
     telegram_chat_id: Mapped[int | None] = mapped_column(BigInteger, unique=True)
     telegram_username: Mapped[str | None] = mapped_column(EncryptedText("users.telegram_username"))
@@ -328,3 +330,18 @@ class LlmUsage(Base):
     total_tokens: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     duration_ms: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+class AdminNote(Base):
+    """The note all admins share on the dashboard: one row. Editing takes the lock first, so two admins never
+    overwrite each other; a lock left behind expires (see app/api/admin.py)."""
+
+    __tablename__ = "admin_notes"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    text: Mapped[str | None] = mapped_column(EncryptedText("admin_notes.text"))
+    version: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_by: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    locked_by: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    locked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

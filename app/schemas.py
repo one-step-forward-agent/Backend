@@ -88,6 +88,7 @@ class UserRead(BaseModel):
     telegram_username: str | None = None
     telegram_linked_at: datetime | None = None
     profile: dict = Field(default_factory=dict)
+    is_admin: bool = False
 
 
 class UserUpdate(BaseModel):

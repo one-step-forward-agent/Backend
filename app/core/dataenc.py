@@ -57,6 +57,7 @@ ENCRYPTED_COLUMNS = (
     ("assistant_drafts", "items", "json"),
     ("recommendation_cache", "items", "json"),
     ("tags", "name", "text"),
+    ("admin_notes", "text", "text"),
 )
 UNREADABLE = "[не удалось расшифровать]"
 

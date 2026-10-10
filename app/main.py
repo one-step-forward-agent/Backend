@@ -5,7 +5,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.api import integrations, internal, reminders
+from app.api import admin, integrations, internal, reminders
 from app.api.auth import google_router, yandex_router, apple_router, notion_router, jira_router, obsidian_router,  session_router
 from app.api.routes import router
 from app.core import errors, ratelimit
@@ -98,6 +98,7 @@ app.include_router(session_router)
 app.include_router(integrations.router)
 app.include_router(reminders.router)
 app.include_router(internal.router)
+app.include_router(admin.router)
 
 
 @app.get("/health")
