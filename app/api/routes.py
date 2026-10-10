@@ -1,3 +1,4 @@
+import hashlib
 import subprocess
 from pathlib import Path
 from datetime import date, datetime, timedelta
@@ -41,8 +42,9 @@ from app.schemas import (
     UserRead,
     UserUpdate,
 )
-from app.services import chat, insights, tasks
+from app.services import chat, insights, tasks, usage
 from app.services.dates import valid_rrule
+from app.services.ru import plural
 from app.services.events import default_calendar, google_provider, push_new_events_to_google, remember_google_token
 from app.services.integrations.google import google_event_body
 from app.services.integrations.service import event_payload
@@ -51,10 +53,33 @@ router = APIRouter(prefix="/api")
 
 # Per-user limits on paid/heavy work (GigaChat requests, speech recognition, document parsing)
 ASSISTANT_LIMIT, ASSISTANT_WINDOW = 60, 60 * 60
+ASSISTANT_BURST, ASSISTANT_BURST_WINDOW = 8, 60
+# The same text again and again is spam or a stuck client, not a conversation
+ASSISTANT_REPEATS, ASSISTANT_REPEATS_WINDOW = 3, 10 * 60
 UPLOAD_LIMIT, UPLOAD_WINDOW = 30, 60 * 60
 
 
-def limit_assistant(user: User) -> None:
+def wait_text(seconds: int) -> str:
+    minutes = max(1, round(seconds / 60))
+    if minutes < 90:
+        return f"{minutes} {plural(minutes, 'минуту', 'минуты', 'минут')}"
+    hours = round(minutes / 60)
+    return f"{hours} {plural(hours, 'час', 'часа', 'часов')}"
+
+
+async def limit_assistant(session: AsyncSession, user: User, text: str | None = None) -> None:
+    """Checks before a request that costs model tokens: a temporary pause for whoever uses the assistant excessively."""
+    wait = await usage.blocked_for(session, user.id)
+    if wait:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Лимит ассистента исчерпан — он снова ответит через {wait_text(wait)}. «Сегодня», «Завтра» и «Статистика» работают и сейчас.",
+            headers={"Retry-After": str(wait)},
+        )
+    ratelimit.hit(f"assistant-burst:{user.id}", ASSISTANT_BURST, ASSISTANT_BURST_WINDOW, "Слишком часто — подождите минуту")
+    if text:
+        digest = hashlib.sha256(" ".join(text.lower().split()).encode()).hexdigest()[:16]
+        ratelimit.hit(f"assistant-same:{user.id}:{digest}", ASSISTANT_REPEATS, ASSISTANT_REPEATS_WINDOW, "Это сообщение уже отправлено несколько раз — подождите немного")
     ratelimit.hit(f"assistant:{user.id}", ASSISTANT_LIMIT, ASSISTANT_WINDOW, "Слишком много запросов к ассистенту, попробуйте через час")
 
 
@@ -298,7 +323,9 @@ async def delete_tag(tag_id: int, user: User = Depends(get_current_user), sessio
 
 @router.post("/assistant/chat")
 async def assistant_chat(payload: ChatRequest, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
-    limit_assistant(user)
+    if not chat.command(payload.text):
+        # Quick commands ("Сегодня", "Статистика") need no model and are never limited
+        await limit_assistant(session, user, payload.text)
     try:
         return await chat.handle_message(session, user, payload.text)
     except chat.AssistantUnavailable:
@@ -485,10 +512,10 @@ async def delete_file(file_id: int, user: User = Depends(get_current_user), sess
 
 
 @router.post("/assistant/message", response_model=AssistantResponse)
-async def assistant_message(payload: AssistantMessage, user: User = Depends(get_current_user)):
+async def assistant_message(payload: AssistantMessage, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
     if not settings.llm_enabled:
         raise HTTPException(status_code=503, detail="Временная ошибка — попробуйте ещё раз через минуту")
-    limit_assistant(user)
+    await limit_assistant(session, user, payload.text)
     from services.gigachat import GigaChatClient
 
     try:
@@ -554,7 +581,7 @@ async def export_calendar(user: User = Depends(get_current_user), session: Async
 async def assistant_search(payload: AssistantMessage, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
     if not settings.llm_enabled:
         raise HTTPException(status_code=503, detail="Временная ошибка — попробуйте ещё раз через минуту")
-    limit_assistant(user)
+    await limit_assistant(session, user, payload.text)
     from services.gigachat import GigaChatClient
 
     try:

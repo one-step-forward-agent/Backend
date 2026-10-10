@@ -5,7 +5,12 @@ works for a user), so the model client does not need a database session or a use
 
 import logging
 from contextvars import ContextVar
+from datetime import datetime, timedelta, timezone
 
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.config import settings
 from app.core.database import session_factory
 from app.models.models import LlmUsage
 
@@ -39,3 +44,25 @@ async def record(purpose: str, model: str | None, usage: dict | None, duration_m
             await session.commit()
     except Exception:
         logger.exception("Could not record language model token usage")
+
+
+async def blocked_for(session: AsyncSession, user_id: int) -> int | None:
+    """Seconds until the user may use the model again, or None when they are within their token budgets."""
+    now = datetime.now(timezone.utc)
+    for budget, window in ((settings.llm_user_tokens_per_hour, timedelta(hours=1)), (settings.llm_user_tokens_per_day, timedelta(days=1))):
+        if budget <= 0:
+            continue
+        since = now - window
+        spent = await session.scalar(select(func.coalesce(func.sum(LlmUsage.total_tokens), 0)).where(LlmUsage.user_id == user_id, LlmUsage.created_at > since))
+        if spent < budget:
+            continue
+        # Free again once enough of the window's requests have aged out: walk them from the oldest
+        rows = (await session.execute(
+            select(LlmUsage.created_at, LlmUsage.total_tokens).where(LlmUsage.user_id == user_id, LlmUsage.created_at > since).order_by(LlmUsage.created_at)
+        )).all()
+        for created_at, tokens in rows:
+            spent -= tokens
+            if spent < budget:
+                return max(60, int((created_at + window - now).total_seconds()) + 1)
+        return int(window.total_seconds())
+    return None

@@ -172,6 +172,8 @@ class DraftNotFound(Exception):
 
 
 HISTORY_LIMIT = 60
+# The chat page shows at most 200 messages (see /api/assistant/history)
+KEEP_MESSAGES = 200
 MAX_STORED_REPLY = 60_000
 
 
@@ -257,16 +259,33 @@ async def calendar_context(session: AsyncSession, user: User, tz: ZoneInfo) -> s
     return "\n".join(lines) or "(в календаре на ближайшую неделю ничего нет)"
 
 
-async def recent_context(session: AsyncSession, user_id: int) -> str:
+async def prune_history(session: AsyncSession, user_id: int) -> None:
+    """The chat keeps a month and at most KEEP_MESSAGES messages; rated answers stay for the ratings export."""
     since = datetime.now(timezone.utc) - timedelta(days=CONTEXT_DAYS)
     await session.execute(delete(ConversationMessage).where(ConversationMessage.user_id == user_id, ConversationMessage.created_at < since))
+    oldest_kept = await session.scalar(
+        select(ConversationMessage.id)
+        .where(ConversationMessage.user_id == user_id)
+        .order_by(ConversationMessage.id.desc())
+        .offset(KEEP_MESSAGES - 1)
+        .limit(1)
+    )
+    if oldest_kept is not None:
+        await session.execute(
+            delete(ConversationMessage).where(
+                ConversationMessage.user_id == user_id, ConversationMessage.id < oldest_kept, ConversationMessage.rating.is_(None)
+            )
+        )
+
+
+async def recent_context(session: AsyncSession, user_id: int) -> str:
     rows = await session.scalars(
         select(ConversationMessage)
         .where(ConversationMessage.user_id == user_id)
         .order_by(ConversationMessage.created_at.desc(), ConversationMessage.id.desc())
         .limit(CONTEXT_MESSAGES)
     )
-    return "\n".join(f"{row.role}: {row.content[:1200]}" for row in reversed(list(rows)))
+    return "\n".join(f"{row.role}: {row.content[:600]}" for row in reversed(list(rows)))
 
 
 # ---------- agenda and search ----------
@@ -1426,8 +1445,8 @@ async def handle_message(session: AsyncSession, user: User, text: str) -> dict:
     usage.current_user_id.set(user.id)
     tz = tasks.local_tz(user)
     text = text.strip()[:50000]
-    history = await recent_context(session, user.id)
-    reply = await route(session, user, text, tz, history)
+    await prune_history(session, user.id)
+    reply = await route(session, user, text, tz)
     await remember(session, user.id, "user", text)
     message = await remember(session, user.id, "assistant", summarize(reply), reply)
     await session.commit()
@@ -1435,7 +1454,7 @@ async def handle_message(session: AsyncSession, user: User, text: str) -> dict:
     return {**reply, "message_id": message.id}
 
 
-async def route(session: AsyncSession, user: User, text: str, tz: ZoneInfo, history: str) -> dict:
+async def route(session: AsyncSession, user: User, text: str, tz: ZoneInfo) -> dict:
     """Recognized actions run here and never depend on what the model writes about them."""
     draft = await pending_edit(session, user)
     if draft:
@@ -1453,6 +1472,8 @@ async def route(session: AsyncSession, user: User, text: str, tz: ZoneInfo, hist
         except agent.AgentFailed:
             # GigaChat is unreachable before anything was done: the rules below still handle the usual requests
             pass
+    # Only the rules' model requests read the conversation as text; the agent reads it itself
+    history = await recent_context(session, user.id)
     reply = None
     if is_delete_request(text):
         reply = await delete_request(session, user, text, tz)

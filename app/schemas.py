@@ -39,6 +39,9 @@ class RegisterRequest(Credentials):
     password: str = Field(min_length=8, max_length=128)
     name: str | None = Field(default=None, max_length=200)
     timezone: str | None = None
+    # Spam protection from the sign-up form: a field hidden from people, and how long the form was open
+    website: str | None = Field(default=None, max_length=200)
+    form_ms: int | None = None
 
     @field_validator("timezone")
     @classmethod

@@ -74,6 +74,10 @@ class Settings:
     gigachat_agent_model: str = os.getenv("GIGACHAT_AGENT_MODEL") or os.getenv("GIGACHAT_MODEL", "GigaChat")
     # Which service answers every model request: "gigachat" or "openai" (any OpenAI-compatible API at BASE_URL)
     llm_provider: str = os.getenv("LLM_PROVIDER", "gigachat").strip().lower()
+    # Model tokens one user may spend; over it the assistant pauses for them until older requests leave the window
+    # (quick commands like «Сегодня» keep working, they need no model). 0 turns a limit off.
+    llm_user_tokens_per_hour: int = int(os.getenv("LLM_USER_TOKENS_PER_HOUR", "60000"))
+    llm_user_tokens_per_day: int = int(os.getenv("LLM_USER_TOKENS_PER_DAY", "250000"))
     openai_api_key: str = os.getenv("API_KEY", "").strip()
     openai_base_url: str = os.getenv("BASE_URL", "").strip().rstrip("/")
     openai_model: str = os.getenv("OPENAI_MODEL", "").strip()

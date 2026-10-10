@@ -51,6 +51,15 @@ LOGIN_MAX_FAILURES_PER_EMAIL = 10
 LOGIN_MAX_FAILURES_PER_IP = 30
 REGISTER_WINDOW_SECONDS = 60 * 60
 REGISTER_MAX_PER_IP = 10
+REGISTER_MAX_PER_IP_DAY = 20
+# A person needs a few seconds to fill the form; a bot posts it at once
+REGISTER_MIN_FORM_MS = 2500
+# Throwaway mailboxes are what sign-up spam uses
+DISPOSABLE_DOMAINS = {
+    "mailinator.com", "guerrillamail.com", "guerrillamail.net", "sharklasers.com", "10minutemail.com", "temp-mail.org",
+    "tempmail.com", "yopmail.com", "trashmail.com", "getnada.com", "dispostable.com", "maildrop.cc", "throwawaymail.com",
+    "fakeinbox.com", "mohmal.com", "emailondeck.com", "mintemail.com", "tempail.com", "dropmail.me", "1secmail.com",
+}
 REFRESH_REUSE_GRACE = timedelta(seconds=30)
 
 
@@ -110,6 +119,12 @@ async def register(payload: RegisterRequest, request: Request, session: AsyncSes
         REGISTER_WINDOW_SECONDS,
         "Слишком много регистраций с вашего адреса, попробуйте позже",
     )
+    ratelimit.hit(f"register-day:{ratelimit.client_ip(request)}", REGISTER_MAX_PER_IP_DAY, 24 * 60 * 60, "Слишком много регистраций с вашего адреса, попробуйте завтра")
+    if payload.website or (payload.form_ms is not None and payload.form_ms < REGISTER_MIN_FORM_MS):
+        logger.info("Sign-up rejected as spam from %s", ratelimit.client_ip(request))
+        raise HTTPException(status_code=422, detail="Не удалось зарегистрироваться — обновите страницу и попробуйте ещё раз")
+    if payload.email.rsplit("@", 1)[-1] in DISPOSABLE_DOMAINS:
+        raise HTTPException(status_code=422, detail="Временные почтовые ящики не подходят — укажите свой email")
     if await session.scalar(select(User.id).where(User.email_hash.in_(email_lookup(payload.email)))):
         raise HTTPException(status_code=409, detail="Пользователь с таким email уже существует")
     user = User(

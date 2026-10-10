@@ -8,7 +8,7 @@ from fastapi.responses import JSONResponse
 from app.api import integrations, internal, reminders
 from app.api.auth import google_router, yandex_router, apple_router, notion_router, jira_router, obsidian_router,  session_router
 from app.api.routes import router
-from app.core import errors
+from app.core import errors, ratelimit
 from app.core.config import settings
 from app.core.database import engine
 from app.models import models  # noqa: F401
@@ -21,6 +21,8 @@ SECURITY_HEADERS = {
     "Referrer-Policy": "strict-origin-when-cross-origin",
 }
 UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+# Writes from one address per minute: far above what a person clicks, a cap for scripts flooding the API
+WRITES_PER_IP_PER_MINUTE = 120
 
 
 @asynccontextmanager
@@ -60,6 +62,17 @@ def _same_origin_or_allowed(request: Request) -> bool:
 async def reject_cross_site_writes(request: Request, call_next):
     if request.method in UNSAFE_METHODS and not _same_origin_or_allowed(request):
         return JSONResponse({"detail": errors.SERVER_ERROR}, status_code=403)
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def throttle_writes(request: Request, call_next):
+    # The bot's internal API comes from one address for all its users
+    if request.method in UNSAFE_METHODS and not request.url.path.startswith("/internal/"):
+        key = f"writes:{ratelimit.client_ip(request)}"
+        if ratelimit.is_limited(key, WRITES_PER_IP_PER_MINUTE, 60):
+            return JSONResponse({"detail": "Слишком много запросов, подождите минуту"}, status_code=429, headers={"Retry-After": "60"})
+        ratelimit.record(key)
     return await call_next(request)
 
 

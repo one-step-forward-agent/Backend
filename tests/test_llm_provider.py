@@ -81,7 +81,8 @@ async def test_the_agent_calls_functions_through_openai_tools(client, user, open
             {"role": "assistant", "content": "Добавила в черновик."},
         ]
     )
-    response = await client.post("/api/assistant/chat", json={"text": "завтра купить хлеб"}, headers=headers)
+    # Two requests in one message: after the first action the model is asked again, with the function's result
+    response = await client.post("/api/assistant/chat", json={"text": "завтра купить хлеб, потом посмотрим"}, headers=headers)
     assert response.status_code == 200, response.text
     reply = response.json()
     assert reply["draft_id"] and [item["title"] for item in reply["events"]] == ["Купить хлеб"]

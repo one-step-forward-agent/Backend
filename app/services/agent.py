@@ -26,10 +26,19 @@ from app.services.ru import MONTHS, WEEKDAYS, WEEKDAYS_SHORT, day_label, plural
 
 logger = logging.getLogger(__name__)
 
-MAX_STEPS = 6
-HISTORY_MESSAGES = 10
+MAX_STEPS = 5
+# Every step resends the whole conversation, so the model sees only the recent part of it, in short:
+# a request a few hours old is a new conversation, and the plan above already shows what was done
+HISTORY_MESSAGES = 6
+HISTORY_HOURS = 6
+HISTORY_USER_CHARS = 600
+HISTORY_ASSISTANT_CHARS = 300
 PLAN_DAYS = 7
-PLAN_LINES = 60
+PLAN_LINES = 40
+# Functions whose result the app words itself: after them the model's closing text is not shown
+ACTIONS = {"create_events", "update_event", "move_events", "delete_events", "complete_events", "create_reminder", "cancel_reminder"}
+# A message that may hold a second request ("добавь созвон и удали отчёт") lets the model go on after an action
+MORE_REQUESTS = re.compile(r"[,;\n]|\s(и|а\s+также|потом|затем|плюс|ещ[её])\s", re.I)
 TABLE_DAYS = 14
 MAX_FOUND = 40
 MAX_SELECTED = 500
@@ -986,11 +995,13 @@ async def history_messages(turn: Turn) -> list[dict]:
     mentioned = {value for row in rows for value in chat.reply_event_ids(row.reply or {})}
     existing = set(await turn.session.scalars(select(Event.id).where(Event.user_id == turn.user.id, Event.id.in_(list(mentioned)[:MAX_SELECTED])))) if mentioned else set()
     messages = []
+    since = datetime.now(timezone.utc) - timedelta(hours=HISTORY_HOURS)
     for row in reversed(rows):
-        if row.created_at < datetime.now(timezone.utc) - timedelta(days=chat.CONTEXT_DAYS):
+        if row.created_at < since:
             continue
         role = "user" if row.role == "user" else "assistant"
-        content = row.content[:1500] + (reply_note(row.reply, turn, existing) if role == "assistant" else "")
+        limit = HISTORY_USER_CHARS if role == "user" else HISTORY_ASSISTANT_CHARS
+        content = row.content[:limit] + (reply_note(row.reply, turn, existing) if role == "assistant" else "")
         if messages and messages[-1]["role"] == role:
             messages[-1]["content"] += "\n" + content
         else:
@@ -1056,7 +1067,10 @@ async def run(session: AsyncSession, user: User, text: str, tz: ZoneInfo) -> dic
                 result = {"error": "Внутренняя ошибка, попробуй по-другому или извинись перед пользователем."}
         logger.info("Agent called %s(%s) -> %s", name, json.dumps(args, ensure_ascii=False)[:300], result.get("error") or "ok")
         messages.append({"role": "assistant", "content": message.get("content") or "", "function_call": {"name": name, "arguments": args}, **({"functions_state_id": message["functions_state_id"]} if message.get("functions_state_id") else {})})
-        messages.append({"role": "function", "name": name or "unknown", "content": json.dumps(result, ensure_ascii=False, default=str)})
+        messages.append({"role": "function", "name": name or "unknown", "content": json.dumps(result, ensure_ascii=False, default=str, separators=(",", ":"))})
+        if name in ACTIONS and turn.changed and not (result.get("error") or result.get("skipped")) and not turn.analysed and not MORE_REQUESTS.search(text):
+            # The reply to a done action is written by the app (see finish): one more request would only pay for unused text
+            break
     if not turn.changed and not turn.analysed:
         reply = await by_rules(turn)
         if reply is not None:
