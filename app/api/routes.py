@@ -486,7 +486,7 @@ async def delete_file(file_id: int, user: User = Depends(get_current_user), sess
 
 @router.post("/assistant/message", response_model=AssistantResponse)
 async def assistant_message(payload: AssistantMessage, user: User = Depends(get_current_user)):
-    if not settings.gigachat_credentials:
+    if not settings.llm_enabled:
         raise HTTPException(status_code=503, detail="Временная ошибка — попробуйте ещё раз через минуту")
     limit_assistant(user)
     from services.gigachat import GigaChatClient
@@ -552,7 +552,7 @@ async def export_calendar(user: User = Depends(get_current_user), session: Async
 
 @router.post("/assistant/search")
 async def assistant_search(payload: AssistantMessage, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
-    if not settings.gigachat_credentials:
+    if not settings.llm_enabled:
         raise HTTPException(status_code=503, detail="Временная ошибка — попробуйте ещё раз через минуту")
     limit_assistant(user)
     from services.gigachat import GigaChatClient

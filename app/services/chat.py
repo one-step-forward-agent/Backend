@@ -416,7 +416,7 @@ def search_title(filters: dict, today: date) -> str:
 
 async def search(session: AsyncSession, user: User, text: str, tz: ZoneInfo) -> dict:
     filters = local_filters(text, tz)
-    if filters is None and settings.gigachat_credentials:
+    if filters is None and settings.llm_enabled:
         from services.gigachat import GigaChatClient
 
         try:
@@ -1264,7 +1264,7 @@ async def change_request(session: AsyncSession, user: User, text: str, tz: ZoneI
     now = datetime.now(tz)
     change = parse_change(text, now)
     event = await find_event(session, user, change["target"], tz) if change else None
-    if not event and settings.gigachat_credentials:
+    if not event and settings.llm_enabled:
         from services.gigachat import GigaChatClient
 
         try:
@@ -1276,7 +1276,7 @@ async def change_request(session: AsyncSession, user: User, text: str, tz: ZoneI
     verb = EDIT_REQUEST.match(text)
     asks = not verb or not re.search(r"(?:ть|ти)$", verb.group("verb").lower()) or re.match(r"^\s*\S*\s*(?:можешь|можно|могла)", text, re.I)
     if not change:
-        if asks and not settings.gigachat_credentials:
+        if asks and not settings.llm_enabled:
             return {"kind": "answer", "text": "Напишите, что и на когда изменить, — например, «перенеси встречу с Олей на пятницу в 15:00»."}
         return None
     if not event:
@@ -1383,7 +1383,7 @@ def summarize(reply: dict) -> str:
 async def extract_items(text: str, tz: ZoneInfo, history: str, calendar: str = "") -> tuple[list[dict], str | None, str | None]:
     """New tasks in the message, the model's answer and what the user wants (create, change, delete, ...)."""
     now = datetime.now(tz)
-    if not settings.gigachat_credentials:
+    if not settings.llm_enabled:
         items = local_items(text, now)
         if not items:
             raise AssistantUnavailable
@@ -1445,7 +1445,7 @@ async def route(session: AsyncSession, user: User, text: str, tz: ZoneInfo, hist
     name = command(text)
     if name:
         return await run_command(session, user, name)
-    if settings.assistant_agent and settings.gigachat_credentials:
+    if settings.assistant_agent and settings.llm_enabled:
         from app.services import agent
 
         try:
@@ -1468,10 +1468,10 @@ async def route(session: AsyncSession, user: User, text: str, tz: ZoneInfo, hist
         return reply
     if is_question(text):
         return await search(session, user, text, tz)
-    items = simple_task(text, datetime.now(tz)) if settings.gigachat_credentials else []
+    items = simple_task(text, datetime.now(tz)) if settings.llm_enabled else []
     answer = intent = None
     if not items:
-        calendar = await calendar_context(session, user, tz) if settings.gigachat_credentials else ""
+        calendar = await calendar_context(session, user, tz) if settings.llm_enabled else ""
         items, answer, intent = await extract_items(text, tz, history, calendar)
     if not items and intent in ("delete", "complete", "analyze", "change", "breakdown"):
         routed = {
@@ -1495,7 +1495,7 @@ async def route(session: AsyncSession, user: User, text: str, tz: ZoneInfo, hist
             return await confirm_draft(session, user, draft.id)
         # At night "завтра" is ambiguous: the tasks wait for confirmation with the date spelled out
         return proposal(draft, tz, answer=join_text(warning, honest(answer)))
-    if not answer and settings.gigachat_credentials:
+    if not answer and settings.llm_enabled:
         from services.gigachat import GigaChatClient
 
         try:
@@ -1650,7 +1650,7 @@ async def analyze_request(session: AsyncSession, user: User, text: str, tz: Zone
     moves = await insights.plan_moves(session, user, now, first, last)
     data = {**data, "moves": [f"{event.title} → {insights.day_text(day, today)}" for event, day in moves]}
     summary = None
-    if settings.gigachat_credentials:
+    if settings.llm_enabled:
         from services.gigachat import GigaChatClient
 
         try:
@@ -1685,7 +1685,7 @@ BREAKDOWN_UNCLEAR = (
 async def breakdown_request(session: AsyncSession, user: User, text: str, tz: ZoneInfo) -> dict:
     """A big task ("подготовиться к экзамену 20 октября") split into steps laid out over the days before it,
     shown as a draft: the user sees how it fits the calendar, edits and saves it."""
-    if not settings.gigachat_credentials:
+    if not settings.llm_enabled:
         return {"kind": "answer", "text": BREAKDOWN_UNAVAILABLE}
     found = await breakdown_items(session, user, text, tz)
     if isinstance(found, str):

@@ -451,7 +451,7 @@ async def _cached(session: AsyncSession, user: User, scope: str, key: str, data:
     found = rules(data)
     # GigaChat is paid: at most RECOMMENDATION_CALLS per hour per user, rules otherwise
     key_name = f"recommendations:{user.id}"
-    if settings.gigachat_credentials and not ratelimit.is_limited(key_name, RECOMMENDATION_CALLS, 3600):
+    if settings.llm_enabled and not ratelimit.is_limited(key_name, RECOMMENDATION_CALLS, 3600):
         ratelimit.record(key_name)
         usage.current_user_id.set(user.id)
         from services.gigachat import GigaChatClient

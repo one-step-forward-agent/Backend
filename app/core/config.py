@@ -72,6 +72,12 @@ class Settings:
     # off: the older rule-based routing in app/services/chat.py answers alone
     assistant_agent: bool = _bool("ASSISTANT_AGENT", True)
     gigachat_agent_model: str = os.getenv("GIGACHAT_AGENT_MODEL") or os.getenv("GIGACHAT_MODEL", "GigaChat")
+    # Which service answers every model request: "gigachat" or "openai" (any OpenAI-compatible API at BASE_URL)
+    llm_provider: str = os.getenv("LLM_PROVIDER", "gigachat").strip().lower()
+    openai_api_key: str = os.getenv("API_KEY", "").strip()
+    openai_base_url: str = os.getenv("BASE_URL", "").strip().rstrip("/")
+    openai_model: str = os.getenv("OPENAI_MODEL", "").strip()
+    openai_agent_model: str = (os.getenv("OPENAI_AGENT_MODEL") or os.getenv("OPENAI_MODEL", "")).strip()
     jwt_algorithm: str = os.getenv("JWT_ALGORITHM", "HS256")
     jwt_expire_minutes: int = int(os.getenv("JWT_EXPIRE_MINUTES", "15"))
     jwt_refresh_expire_days: int = int(os.getenv("JWT_REFRESH_EXPIRE_DAYS", "30"))
@@ -91,7 +97,31 @@ class Settings:
     cors_origins: tuple[str, ...] = _list("CORS_ORIGINS")
     public_app_url: str = os.getenv("PUBLIC_APP_URL", "").strip().rstrip("/")
 
+    @property
+    def uses_openai(self) -> bool:
+        return self.llm_provider == "openai"
+
+    @property
+    def llm_enabled(self) -> bool:
+        """Whether the selected model service is configured; without it the assistant answers by rules alone."""
+        if self.uses_openai:
+            return bool(self.openai_api_key and self.openai_base_url and self.openai_model)
+        return bool(self.gigachat_credentials)
+
+    @property
+    def llm_model(self) -> str:
+        return self.openai_model if self.uses_openai else self.gigachat_model
+
+    @property
+    def llm_agent_model(self) -> str:
+        return self.openai_agent_model if self.uses_openai else self.gigachat_agent_model
+
     def validate(self) -> None:
+        if self.llm_provider not in {"gigachat", "openai"}:
+            raise RuntimeError(f"LLM_PROVIDER must be gigachat or openai, not {self.llm_provider!r}")
+        if self.uses_openai and not self.llm_enabled:
+            missing = [name for name, value in (("API_KEY", self.openai_api_key), ("BASE_URL", self.openai_base_url), ("OPENAI_MODEL", self.openai_model)) if not value]
+            logger.warning("LLM_PROVIDER=openai but %s is not set; the assistant answers by rules only", ", ".join(missing))
         problems = []
         if self.secret_key in PLACEHOLDER_SECRETS or len(self.secret_key) < 32:
             problems.append("SECRET_KEY must be a random value of at least 32 characters")

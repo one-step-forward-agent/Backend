@@ -137,7 +137,72 @@ def parse_search_filters_response(content: str) -> dict:
     return result
 
 
+def usage_counts(counts: dict | None) -> dict | None:
+    """OpenAI-compatible APIs report cached prompt tokens in prompt_tokens_details; GigaChat as precached_prompt_tokens."""
+    if not isinstance(counts, dict) or "precached_prompt_tokens" in counts:
+        return counts
+    details = counts.get("prompt_tokens_details")
+    cached = details.get("cached_tokens") if isinstance(details, dict) else None
+    return {**counts, "precached_prompt_tokens": cached} if cached is not None else counts
+
+
+# ---------- the agent's functions in the OpenAI tools format ----------
+# The agent keeps its history in GigaChat's format (function_call, role "function"); these translate it both ways.
+
+
+def openai_tools(functions: list[dict]) -> list[dict]:
+    """GigaChat function specs as OpenAI tools; few_shot_examples is GigaChat-only, so the examples go to the description."""
+    tools = []
+    for spec in functions:
+        description = spec.get("description", "")
+        examples = spec.get("few_shot_examples") or []
+        if examples:
+            description += " Примеры: " + "; ".join(
+                f"«{example['request']}» → {json.dumps(example['params'], ensure_ascii=False)}" for example in examples
+            )
+        function = {"name": spec["name"], "description": description, "parameters": spec.get("parameters") or {"type": "object", "properties": {}}}
+        tools.append({"type": "function", "function": function})
+    return tools
+
+
+def openai_messages(messages: list[dict]) -> list[dict]:
+    """The agent's history as OpenAI messages: every function call gets an id that its result refers to."""
+    converted = []
+    call_id = None
+    for index, message in enumerate(messages):
+        call = message.get("function_call")
+        if call:
+            call_id = f"call_{index}"
+            arguments = json.dumps(call.get("arguments") or {}, ensure_ascii=False)
+            tool_call = {"id": call_id, "type": "function", "function": {"name": call.get("name"), "arguments": arguments}}
+            converted.append({"role": "assistant", "content": message.get("content") or None, "tool_calls": [tool_call]})
+        elif message.get("role") == "function":
+            converted.append({"role": "tool", "tool_call_id": call_id or "call_0", "content": message.get("content") or ""})
+        else:
+            converted.append({"role": message["role"], "content": message.get("content") or ""})
+    return converted
+
+
+def gigachat_message(message: dict) -> dict:
+    """An OpenAI answer in the agent's format. The agent runs one function per step: the first tool call is taken,
+    and the model calls the others in the next steps, seeing this one's result."""
+    result = {"role": "assistant", "content": message.get("content") or ""}
+    tool_calls = message.get("tool_calls") or []
+    function = tool_calls[0].get("function") if tool_calls else message.get("function_call")
+    if function:
+        arguments = function.get("arguments")
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments) if arguments.strip() else {}
+            except json.JSONDecodeError:
+                arguments = {}
+        result["function_call"] = {"name": function.get("name"), "arguments": arguments if isinstance(arguments, dict) else {}}
+    return result
+
+
 class GigaChatClient:
+    """Language model client. Despite the name it also talks to an OpenAI-compatible API when LLM_PROVIDER=openai."""
+
     token_url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
     chat_url = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
 
@@ -171,13 +236,25 @@ class GigaChatClient:
             logger.info("GigaChat access token received")
             return await response.json()
 
-    async def _chat(self, session: aiohttp.ClientSession, headers: dict, payload: dict, purpose: str) -> dict:
-        """One chat completion; its token usage is stored in llm_usage under `purpose`."""
-        started = time.monotonic()
-        async with session.post(self.chat_url, headers=headers, json=payload, ssl=_ssl_context()) as response:
-            response.raise_for_status()
-            result = await response.json()
-        await usage.record(purpose, result.get("model") or payload.get("model"), result.get("usage"), int((time.monotonic() - started) * 1000))
+    async def _complete(self, payload: dict, purpose: str, timeout: float | None = None) -> dict:
+        """One chat completion from the service LLM_PROVIDER selects; its token usage is stored in llm_usage under `purpose`."""
+        client_timeout = aiohttp.ClientTimeout(total=timeout) if timeout else aiohttp.ClientTimeout(total=300)
+        async with aiohttp.ClientSession(timeout=client_timeout) as session:
+            if settings.uses_openai:
+                url = f"{settings.openai_base_url}/chat/completions"
+                headers = {"Authorization": f"Bearer {settings.openai_api_key}", "Content-Type": "application/json"}
+                ssl_context = True
+            else:
+                url = self.chat_url
+                headers = {"Authorization": f"Bearer {await self._token(session)}", "Content-Type": "application/json"}
+                ssl_context = _ssl_context()
+            started = time.monotonic()
+            async with session.post(url, headers=headers, json=payload, ssl=ssl_context) as response:
+                if response.status >= 400:
+                    logger.error("%s request failed: status=%s body=%s", settings.llm_provider, response.status, (await response.text())[:500])
+                response.raise_for_status()
+                result = await response.json()
+        await usage.record(purpose, result.get("model") or payload.get("model"), usage_counts(result.get("usage")), int((time.monotonic() - started) * 1000))
         return result
 
     async def process_message(
@@ -250,16 +327,13 @@ class GigaChatClient:
             "Текущий запрос (единственный источник новых событий):\n"
             f"{text[:50000]}"
         )
-        async with aiohttp.ClientSession() as session:
-            token = await self._token(session)
-            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-            payload = {
-                "model": settings.gigachat_model,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.1,
-                "max_tokens": 6000,
-            }
-            result = await self._chat(session, headers, payload, "process_message")
+        payload = {
+            "model": settings.llm_model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.1,
+            "max_tokens": 6000,
+        }
+        result = await self._complete(payload, "process_message")
         logger.info("GigaChat response received, input length: %d", len(text))
         content = result["choices"][0]["message"]["content"]
         parsed = parse_message_response(content)
@@ -279,16 +353,13 @@ class GigaChatClient:
             f"Текущие дата и время: {now}. Часовой пояс: {timezone}.\n"
             f"Запрос: {text[:2000]}"
         )
-        async with aiohttp.ClientSession() as session:
-            token = await self._token(session)
-            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-            payload = {
-                "model": settings.gigachat_model,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0,
-                "max_tokens": 180,
-            }
-            result = await self._chat(session, headers, payload, "extract_search_filters")
+        payload = {
+            "model": settings.llm_model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0,
+            "max_tokens": 180,
+        }
+        result = await self._complete(payload, "extract_search_filters")
         return parse_search_filters_response(result["choices"][0]["message"]["content"])
 
     async def chat_reply(
@@ -324,16 +395,13 @@ class GigaChatClient:
             f"{context or '(пусто)'}\n\n"
             f"Сообщение пользователя:\n{text[:6000]}"
         )
-        async with aiohttp.ClientSession() as session:
-            token = await self._token(session)
-            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-            payload = {
-                "model": settings.gigachat_model,
-                "messages": [{"role": "system", "content": system}, {"role": "user", "content": user_message}],
-                "temperature": 0.5,
-                "max_tokens": 600,
-            }
-            result = await self._chat(session, headers, payload, "chat_reply")
+        payload = {
+            "model": settings.llm_model,
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user_message}],
+            "temperature": 0.5,
+            "max_tokens": 600,
+        }
+        result = await self._complete(payload, "chat_reply")
         return result["choices"][0]["message"]["content"].strip()
 
     async def extract_change(self, text: str, timezone: str = "Europe/Moscow", context: str = "") -> dict:
@@ -355,16 +423,13 @@ class GigaChatClient:
             f"Недавний диалог (справочно): {context[-2000:] or '(пусто)'}\n"
             f"Запрос: {text[:2000]}"
         )
-        async with aiohttp.ClientSession() as session:
-            token = await self._token(session)
-            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-            payload = {
-                "model": settings.gigachat_model,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0,
-                "max_tokens": 300,
-            }
-            result = await self._chat(session, headers, payload, "extract_change")
+        payload = {
+            "model": settings.llm_model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0,
+            "max_tokens": 300,
+        }
+        result = await self._complete(payload, "extract_change")
         return parse_search_filters_response(result["choices"][0]["message"]["content"])
 
     async def analysis(self, facts: dict, request: str) -> str:
@@ -388,16 +453,13 @@ class GigaChatClient:
             "Не выдумывай задач, которых нет в фактах. Если в фактах есть profile — учитывай сферы и цели по приоритету и рабочий график.\n"
             f"Факты: {json.dumps(facts, ensure_ascii=False, default=str)}"
         )
-        async with aiohttp.ClientSession() as session:
-            token = await self._token(session)
-            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-            payload = {
-                "model": settings.gigachat_model,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.3,
-                "max_tokens": 700,
-            }
-            result = await self._chat(session, headers, payload, "analysis")
+        payload = {
+            "model": settings.llm_model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.3,
+            "max_tokens": 700,
+        }
+        result = await self._complete(payload, "analysis")
         return clean_list(result["choices"][0]["message"]["content"])
 
     async def breakdown(self, request: str, facts: dict) -> dict:
@@ -418,33 +480,25 @@ class GigaChatClient:
             "\"duration_minutes\": число}]}.\n"
             f"Факты: {json.dumps(facts, ensure_ascii=False, default=str)}"
         )
-        async with aiohttp.ClientSession() as session:
-            token = await self._token(session)
-            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-            payload = {
-                "model": settings.gigachat_model,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.3,
-                "max_tokens": 1500,
-            }
-            result = await self._chat(session, headers, payload, "breakdown")
+        payload = {
+            "model": settings.llm_model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.3,
+            "max_tokens": 1500,
+        }
+        result = await self._complete(payload, "breakdown")
         return parse_search_filters_response(result["choices"][0]["message"]["content"])
 
     async def agent_step(self, messages: list[dict], functions: list[dict]) -> dict:
         """One step of the assistant agent: the model either calls one of `functions` or answers.
         Returns the assistant message as GigaChat sent it ({"content", "function_call"?, "functions_state_id"?})."""
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
-            token = await self._token(session)
-            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-            payload = {
-                "model": settings.gigachat_agent_model,
-                "messages": messages,
-                "functions": functions,
-                "function_call": "auto",
-                "temperature": 0.2,
-                "max_tokens": 1500,
-            }
-            result = await self._chat(session, headers, payload, "agent")
+        payload = {"model": settings.llm_agent_model, "temperature": 0.2, "max_tokens": 1500}
+        if settings.uses_openai:
+            payload |= {"messages": openai_messages(messages), "tools": openai_tools(functions), "tool_choice": "auto"}
+            result = await self._complete(payload, "agent", timeout=60)
+            return gigachat_message(result["choices"][0]["message"])
+        payload |= {"messages": messages, "functions": functions, "function_call": "auto"}
+        result = await self._complete(payload, "agent", timeout=60)
         message = result["choices"][0]["message"]
         call = message.get("function_call")
         if call and isinstance(call.get("arguments"), str):
@@ -478,16 +532,13 @@ class GigaChatClient:
             "\"title\": до 4 слов, \"text\": до 160 символов}].\n"
             f"Факты: {json.dumps(facts, ensure_ascii=False)}"
         )
-        async with aiohttp.ClientSession() as session:
-            token = await self._token(session)
-            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-            payload = {
-                "model": settings.gigachat_model,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.4,
-                "max_tokens": 400,
-            }
-            result = await self._chat(session, headers, payload, "recommendations")
+        payload = {
+            "model": settings.llm_model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.4,
+            "max_tokens": 400,
+        }
+        result = await self._complete(payload, "recommendations")
         return clean_recommendations(result["choices"][0]["message"]["content"], 2)
 
     async def plan_recommendations(self, facts: dict) -> list[dict]:
@@ -510,16 +561,13 @@ class GigaChatClient:
             "\"title\": до 4 слов, \"text\": до 200 символов}].\n"
             f"Факты: {json.dumps(facts, ensure_ascii=False)}"
         )
-        async with aiohttp.ClientSession() as session:
-            token = await self._token(session)
-            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-            payload = {
-                "model": settings.gigachat_model,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.3,
-                "max_tokens": 600,
-            }
-            result = await self._chat(session, headers, payload, "plan_recommendations")
+        payload = {
+            "model": settings.llm_model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.3,
+            "max_tokens": 600,
+        }
+        result = await self._complete(payload, "plan_recommendations")
         return clean_recommendations(result["choices"][0]["message"]["content"], 3)
 
 
